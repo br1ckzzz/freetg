@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+venv/
+.venv/
+
+# PyInstaller / Build / Binaries
+build/
+dist/
+*.manifest
+*.spec.bak
+FreeTG.exe
+
+# Runtime / Portable data / Logs
+FreeTG_data/
+*.log
+selftest.json
+
+# IDE & OS
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini
+.DS_Store
