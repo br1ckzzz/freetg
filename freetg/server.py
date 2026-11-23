@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 import logging
 import socket as _socket
+import sys
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional, Set
+from typing import Callable, List, Optional, Set
 
 from .carousel import DEFAULT_POOL_SIZE_PER_DC, DcCarouselPool
 from .crypto import (
@@ -16,7 +18,6 @@ from .crypto import (
     normalize_secret,
     try_handshake,
 )
-from .session import ClientSession
 
 log = logging.getLogger("freetg.server")
 
@@ -33,6 +34,111 @@ def _human_bytes(n: int) -> str:
     return f"{val:.1f}TB"
 
 
+def install_proactor_socket_guard(loop: asyncio.AbstractEventLoop) -> None:
+    """Prevent stale unclosed sockets when WinError aborts shutdown() in ProactorEventLoop."""
+    if sys.platform != "win32" or not isinstance(loop, asyncio.ProactorEventLoop):
+        return
+    try:
+        from asyncio.proactor_events import _ProactorSocketTransport
+    except Exception:
+        return
+
+    orig = getattr(_ProactorSocketTransport, "_call_connection_lost", None)
+    if orig is None or getattr(orig, "_freetg_guarded", False):
+        return
+
+    def _safe_call_connection_lost(self, exc):
+        if self._called_connection_lost:
+            return
+        try:
+            self._protocol.connection_lost(exc)
+        finally:
+            sock = self._sock
+            if sock is not None:
+                try:
+                    if hasattr(sock, "shutdown") and sock.fileno() != -1:
+                        sock.shutdown(_socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                self._sock = None
+            server = self._server
+            if server is not None:
+                try:
+                    if sys.version_info >= (3, 13):
+                        server._detach(self)
+                    else:
+                        server._detach()
+                except Exception:
+                    pass
+                self._server = None
+            self._called_connection_lost = True
+
+    _safe_call_connection_lost._freetg_guarded = True
+    _ProactorSocketTransport._call_connection_lost = _safe_call_connection_lost
+
+
+class _TrackedClientProtocol(asyncio.StreamReaderProtocol):
+    """StreamReaderProtocol that notifies pending upstream dials when local client disconnects."""
+
+    def __init__(
+        self,
+        stream_reader: asyncio.StreamReader,
+        client_connected_cb: Callable[[asyncio.StreamReader, asyncio.StreamWriter], None],
+        loop: Optional[asyncio.AbstractEventLoop] = None,
+    ) -> None:
+        super().__init__(stream_reader, client_connected_cb, loop=loop)
+        self._dial_cancel_cb: Optional[Callable[[], None]] = None
+
+    def _fire_dial_cancel(self) -> None:
+        cb = self._dial_cancel_cb
+        self._dial_cancel_cb = None
+        if cb is not None:
+            cb()
+
+    def eof_received(self):
+        keep_open = super().eof_received()
+        self._fire_dial_cancel()
+        return keep_open
+
+    def connection_lost(self, exc):
+        super().connection_lost(exc)
+        self._fire_dial_cancel()
+
+
+@contextmanager
+def cancel_on_client_gone(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    """Cancel the running task immediately if the local Telegram client closes while dialing upstream."""
+    if reader.at_eof() or writer.is_closing():
+        raise asyncio.CancelledError()
+    transport = writer.transport
+    protocol = transport.get_protocol() if transport is not None else None
+    if not isinstance(protocol, _TrackedClientProtocol):
+        yield
+        return
+    task = asyncio.current_task()
+    if task is None:
+        yield
+        return
+
+    def _cancel() -> None:
+        if not task.done():
+            task.cancel()
+
+    protocol._dial_cancel_cb = _cancel
+    try:
+        yield
+    finally:
+        if protocol._dial_cancel_cb is _cancel:
+            protocol._dial_cancel_cb = None
+
+
+from .session import ClientSession
+
+
 @dataclass
 class FreeTGConfig:
     host: str = "127.0.0.1"
@@ -43,6 +149,7 @@ class FreeTGConfig:
     pool_size: int = DEFAULT_POOL_SIZE_PER_DC
     frag_tls: bool = False
     prefer_port80_cf: bool = False
+    allow_port80_fallback: bool = True
     stats_interval: float = 30.0
     verbose: bool = False
 
@@ -60,6 +167,7 @@ class FreeTGProxyServer:
             pool_size=config.pool_size,
             frag_tls=config.frag_tls,
             prefer_port80_cf=config.prefer_port80_cf,
+            allow_port80_fallback=config.allow_port80_fallback,
         )
         self._servers: List[asyncio.AbstractServer] = []
         self._client_tasks: Set[asyncio.Task] = set()
@@ -174,12 +282,16 @@ class FreeTGProxyServer:
         log.info("=" * 64)
 
     async def _start_server_with_retry(self, port: int) -> asyncio.AbstractServer:
+        loop = asyncio.get_running_loop()
+
+        def _protocol_factory():
+            reader = asyncio.StreamReader(limit=65536, loop=loop)
+            return _TrackedClientProtocol(reader, self._on_client_connected, loop=loop)
+
         last_exc: Optional[OSError] = None
         for attempt in range(5):
             try:
-                return await asyncio.start_server(
-                    self._on_client_connected, self.config.host, port
-                )
+                return await loop.create_server(_protocol_factory, self.config.host, port)
             except OSError as exc:
                 last_exc = exc
                 errno = getattr(exc, "winerror", None) or getattr(exc, "errno", None)
@@ -190,6 +302,7 @@ class FreeTGProxyServer:
         raise last_exc
 
     async def start(self) -> None:
+        install_proactor_socket_guard(asyncio.get_running_loop())
         await self.carousel.initialize()
         try:
             for port in self.config.ports:

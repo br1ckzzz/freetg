@@ -2,7 +2,7 @@
 
 <img src="./assets/logo.png" width="110" alt="FreeTG Logo" />
 
-# FreeTG `v0.2.1`
+# FreeTG `v0.2.2`
 
 **Минималистичный локальный MTProto / WebSocket прокси для Telegram Desktop**
 
@@ -56,7 +56,7 @@
 3. **Сетевые обращения программы:**
    - Локальный порт (`127.0.0.1:1080` по умолчанию) принимает подключения только с вашего компьютера.
    - Исходящий зашифрованный MTProto-трафик направляется к выбранным узлам Cloudflare/Worker для ретрансляции в официальные IP-подсети Telegram DC.
-   - При инициализации пула выполняется один фоновый `GET`-запрос без идентификаторов (`User-Agent: FreeTG/0.2.1`) к публичному списку доменов [`cfproxy-domains.txt`](https://raw.githubusercontent.com/Flowseal/tg-ws-proxy/main/.github/cfproxy-domains.txt) на GitHub.
+   - При инициализации пула выполняется один фоновый `GET`-запрос без идентификаторов (`User-Agent: FreeTG/0.2.2`) к публичному списку доменов [`cfproxy-domains.txt`](https://raw.githubusercontent.com/Flowseal/tg-ws-proxy/main/.github/cfproxy-domains.txt) на GitHub.
 4. **Локальные файлы:** настройки (`config.json`), технические логи соединений (`proxy.log`, без пользовательского контента) и опциональная запись автозапуска в `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` хранятся исключительно на вашем ПК.
 
 ---

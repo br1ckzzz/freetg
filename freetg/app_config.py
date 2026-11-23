@@ -195,15 +195,19 @@ def to_freetg_config(cfg: Dict[str, Any], *, stats_interval: float = 30.0) -> Fr
     if bypass_mode == "port80":
         frag_tls = False
         prefer_port80_cf = True
+        allow_port80_fallback = True
     elif bypass_mode == "tls_frag":
         frag_tls = True
         prefer_port80_cf = False
+        allow_port80_fallback = False
     elif bypass_mode in ("windivert", "direct"):
         frag_tls = False
         prefer_port80_cf = False
+        allow_port80_fallback = False
     else:
         frag_tls = bool(cfg.get("frag_tls", False))
         prefer_port80_cf = False
+        allow_port80_fallback = True
     return FreeTGConfig(
         host=str(cfg.get("host", "127.0.0.1")).strip() or "127.0.0.1",
         ports=[int(cfg.get("port", 1080))],
@@ -213,6 +217,7 @@ def to_freetg_config(cfg: Dict[str, Any], *, stats_interval: float = 30.0) -> Fr
         pool_size=max(0, min(10, int(cfg.get("pool_size", 3)))),
         frag_tls=frag_tls,
         prefer_port80_cf=prefer_port80_cf,
+        allow_port80_fallback=allow_port80_fallback,
         stats_interval=stats_interval,
         verbose=bool(cfg.get("verbose", False)),
     )

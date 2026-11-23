@@ -916,6 +916,7 @@ async def test_worker_connectivity_async(
             pool_size=1,
             frag_tls=use_frag,
             prefer_port80_cf=prefer_port80,
+            allow_port80_fallback=(bmode in ("auto", "port80")),
         )
         try:
             await pool.initialize()

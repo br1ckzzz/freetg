@@ -22,7 +22,15 @@ from freetg.crypto import (
     read_mtproto_packet,
     try_handshake,
 )
-from freetg.server import DEFAULT_SECRET, DEFAULT_WORKER_DOMAIN, FreeTGConfig, FreeTGProxyServer
+from freetg.server import (
+    DEFAULT_SECRET,
+    DEFAULT_WORKER_DOMAIN,
+    FreeTGConfig,
+    FreeTGProxyServer,
+    _TrackedClientProtocol,
+    cancel_on_client_gone,
+    install_proactor_socket_guard,
+)
 
 
 def _build_client_obfs2(secret: bytes, dc_idx: int, proto_tag: bytes):
@@ -94,7 +102,7 @@ class CryptoUnitTests(unittest.TestCase):
                 self.assertEqual(parsed.proto_tag, tag)
 
     def test_public_pool_defaults_and_domain_parsing(self):
-        self.assertEqual(__version__, "0.2.1")
+        self.assertEqual(__version__, "0.2.2")
         self.assertEqual(DEFAULT_WORKER_DOMAIN, "")
         self.assertEqual(parse_worker_domains(""), [])
         self.assertEqual(
@@ -131,6 +139,114 @@ class CryptoUnitTests(unittest.TestCase):
         self.assertIn("lovetrue.co.uk", pool._cf_domain_cooldown)
         picked = pool._pick_public_domain(set())
         self.assertNotEqual(picked, "lovetrue.co.uk")
+
+    def test_worker_429_utc_cooldown_and_bypass_flags(self):
+        pool = DcCarouselPool("w1.example.com, w2.example.com", mode="v1", pool_size=1)
+        self.assertEqual(pool._available_worker_domains(), ["w1.example.com", "w2.example.com"])
+        pool._mark_worker_rate_limited("w1.example.com")
+        self.assertEqual(pool._available_worker_domains(), ["w2.example.com"])
+        self.assertGreater(pool._worker_cooldown["w1.example.com"], time.monotonic())
+
+        self.assertFalse(to_freetg_config({"bypass_mode": "tls_frag"}).allow_port80_fallback)
+        self.assertFalse(to_freetg_config({"bypass_mode": "direct"}).allow_port80_fallback)
+        self.assertFalse(to_freetg_config({"bypass_mode": "windivert"}).allow_port80_fallback)
+        self.assertTrue(to_freetg_config({"bypass_mode": "auto"}).allow_port80_fallback)
+        self.assertTrue(to_freetg_config({"bypass_mode": "port80"}).allow_port80_fallback)
+
+    def test_runtime_port80_fallback_promotion(self):
+        pool = DcCarouselPool("", mode="v1", pool_size=1, allow_port80_fallback=True)
+        self.assertFalse(pool.prefer_port80_cf)
+        pool._record_tls_result(tls_ok=False, tls_timed_out=True)
+        self.assertFalse(pool.prefer_port80_cf)
+        pool._record_tls_result(tls_ok=False, tls_timed_out=True)
+        self.assertTrue(pool.prefer_port80_cf)
+        pool._record_tls_result(tls_ok=True)
+        self.assertEqual(pool._tls_timeout_streak, 0)
+
+    def test_proactor_socket_guard_closes_socket_on_shutdown_error(self):
+        import sys
+        if sys.platform != "win32":
+            return
+
+        async def _run():
+            loop = asyncio.get_running_loop()
+            install_proactor_socket_guard(loop)
+            from asyncio.proactor_events import _ProactorSocketTransport
+
+            class _FakeSock:
+                def __init__(self):
+                    self.closed = False
+
+                def fileno(self):
+                    return 99
+
+                def shutdown(self, how):
+                    raise ConnectionResetError("broken")
+
+                def close(self):
+                    self.closed = True
+
+            class _FakeProto:
+                def __init__(self):
+                    self.lost = False
+
+                def connection_lost(self, exc):
+                    self.lost = True
+
+            class _FakeServer:
+                def __init__(self):
+                    self.detached = False
+
+                def _detach(self, *args):
+                    self.detached = True
+
+            fake_sock = _FakeSock()
+            t = object.__new__(_ProactorSocketTransport)
+            t._called_connection_lost = False
+            t._protocol = _FakeProto()
+            t._sock = fake_sock
+            t._server = _FakeServer()
+            t._call_connection_lost(None)
+            self.assertTrue(fake_sock.closed)
+            self.assertIsNone(t._sock)
+            self.assertIsNone(t._server)
+            self.assertTrue(t._called_connection_lost)
+            self.assertTrue(t._protocol.lost)
+
+        asyncio.run(_run())
+
+    def test_client_disconnect_cancels_upstream_dial(self):
+        async def _run():
+            loop = asyncio.get_running_loop()
+            dial_cancelled = asyncio.Event()
+            dial_started = asyncio.Event()
+
+            async def _on_conn(reader, writer):
+                try:
+                    with cancel_on_client_gone(reader, writer):
+                        dial_started.set()
+                        await asyncio.sleep(5.0)
+                except asyncio.CancelledError:
+                    dial_cancelled.set()
+                finally:
+                    writer.close()
+
+            srv = await loop.create_server(
+                lambda: _TrackedClientProtocol(asyncio.StreamReader(), _on_conn, loop=loop),
+                "127.0.0.1",
+                0,
+            )
+            port = srv.sockets[0].getsockname()[1]
+            try:
+                _, cw = await asyncio.open_connection("127.0.0.1", port)
+                await asyncio.wait_for(dial_started.wait(), timeout=2.0)
+                cw.close()
+                await asyncio.wait_for(dial_cancelled.wait(), timeout=1.0)
+            finally:
+                srv.close()
+                await srv.wait_closed()
+
+        asyncio.run(_run())
 
     def test_packet_roundtrip(self):
         async def _run():

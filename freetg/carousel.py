@@ -119,7 +119,7 @@ def _decode_cfproxy_entry(entry: str) -> str:
 def _fetch_remote_public_domains_sync() -> List[str]:
     req = urllib.request.Request(
         CF_PUBLIC_DOMAINS_URL,
-        headers={"User-Agent": "FreeTG/0.2.1"},
+        headers={"User-Agent": "FreeTG/0.2.2"},
     )
     with urllib.request.urlopen(req, timeout=6.0) as resp:
         raw = resp.read().decode("utf-8", errors="replace")
@@ -365,11 +365,37 @@ class _FragmentedTlsWriter:
         self._closing = True
         self._raw_w.close()
 
+    def abort(self) -> None:
+        self._closing = True
+        transport = getattr(self._raw_w, "transport", None)
+        if transport is not None:
+            transport.abort()
+        else:
+            self._raw_w.close()
+
     async def wait_closed(self) -> None:
         await self._raw_w.wait_closed()
 
     def is_closing(self) -> bool:
         return self._closing or self._raw_w.is_closing()
+
+
+def _abort_writer(writer) -> None:
+    """Immediately abort an underlying transport so failed/timed-out sockets do not linger."""
+    try:
+        if hasattr(writer, "abort"):
+            writer.abort()
+            return
+        transport = getattr(writer, "transport", None)
+        if transport is not None:
+            transport.abort()
+            return
+    except Exception:
+        pass
+    try:
+        writer.close()
+    except Exception:
+        pass
 
 
 async def _open_tls_socket(
@@ -424,26 +450,28 @@ async def _open_tls_socket(
         raw_w.write(ch)
         await raw_w.drain()
 
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
     while True:
         try:
             sslobj.do_handshake()
             rem = outg.read()
             if rem:
                 raw_w.write(rem)
-                await raw_w.drain()
+                await asyncio.wait_for(raw_w.drain(), timeout=max(0.25, deadline - loop.time()))
             break
         except ssl.SSLWantReadError:
             rem = outg.read()
             if rem:
                 raw_w.write(rem)
-                await raw_w.drain()
-            raw = await asyncio.wait_for(raw_r.read(16384), timeout=timeout)
+                await asyncio.wait_for(raw_w.drain(), timeout=max(0.25, deadline - loop.time()))
+            raw = await asyncio.wait_for(raw_r.read(16384), timeout=max(0.25, deadline - loop.time()))
             if not raw:
-                raw_w.close()
+                _abort_writer(raw_w)
                 raise ConnectionError("EOF during fragmented TLS handshake")
             inc.write(raw)
         except BaseException:
-            raw_w.close()
+            _abort_writer(raw_w)
             raise
 
     drain_lock = asyncio.Lock()
@@ -613,15 +641,19 @@ class StreamingWorkerSocket(_BaseWsSocket):
         ssl_ctx: ssl.SSLContext,
         frag_tls: bool = False,
         use_tls: bool = True,
+        timeout: float = CONNECT_TIMEOUT,
     ) -> "StreamingWorkerSocket":
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        conn_timeout = max(0.25, deadline - loop.time())
         if use_tls:
             reader, writer = await _open_tls_socket(
-                cf_ip, cf_port, sni_host, ssl_ctx, CONNECT_TIMEOUT, frag_tls=frag_tls
+                cf_ip, cf_port, sni_host, ssl_ctx, conn_timeout, frag_tls=frag_tls
             )
         else:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(cf_ip, cf_port),
-                timeout=CONNECT_TIMEOUT,
+                timeout=conn_timeout,
             )
             _set_tcp_nodelay(writer)
         try:
@@ -637,8 +669,10 @@ class StreamingWorkerSocket(_BaseWsSocket):
                 f"{proto_hdr}\r\n"
             ).encode()
             writer.write(req)
-            await writer.drain()
-            status, _, leftover = await _read_http_headers(reader, CONNECT_TIMEOUT)
+            await asyncio.wait_for(writer.drain(), timeout=max(0.25, deadline - loop.time()))
+            status, _, leftover = await _read_http_headers(
+                reader, max(0.25, deadline - loop.time())
+            )
             if status == 429:
                 raise WorkerRateLimitError("Cloudflare Worker returned HTTP 429")
             if status != 101:
@@ -655,7 +689,7 @@ class StreamingWorkerSocket(_BaseWsSocket):
                 leftover=leftover,
             )
         except BaseException:
-            writer.close()
+            _abort_writer(writer)
             raise
 
     async def recv_ws(self, timeout: float = STREAM_READ_TIMEOUT) -> Optional[bytes]:
@@ -717,9 +751,12 @@ class EphemeralWorkerSocket(_BaseWsSocket):
         mode: str,
         ssl_ctx: ssl.SSLContext,
         frag_tls: bool = False,
+        timeout: float = CONNECT_TIMEOUT,
     ) -> "EphemeralWorkerSocket":
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
         reader, writer = await _open_tls_socket(
-            cf_ip, cf_port, worker_domain, ssl_ctx, CONNECT_TIMEOUT, frag_tls=frag_tls
+            cf_ip, cf_port, worker_domain, ssl_ctx, max(0.25, deadline - loop.time()), frag_tls=frag_tls
         )
         try:
             if mode == "v1":
@@ -733,8 +770,10 @@ class EphemeralWorkerSocket(_BaseWsSocket):
                     f"Sec-WebSocket-Version: 13\r\n\r\n"
                 ).encode()
                 writer.write(req)
-                await writer.drain()
-                status, _, leftover = await _read_http_headers(reader, CONNECT_TIMEOUT)
+                await asyncio.wait_for(writer.drain(), timeout=max(0.25, deadline - loop.time()))
+                status, _, leftover = await _read_http_headers(
+                    reader, max(0.25, deadline - loop.time())
+                )
                 if status == 429:
                     raise WorkerRateLimitError("Cloudflare Worker returned HTTP 429")
                 if status != 101:
@@ -753,7 +792,7 @@ class EphemeralWorkerSocket(_BaseWsSocket):
                 leftover=leftover,
             )
         except BaseException:
-            writer.close()
+            _abort_writer(writer)
             raise
 
     async def _fill_inner_buf(self) -> bool:
@@ -983,6 +1022,7 @@ class DcCarouselPool:
         pool_size: int = DEFAULT_POOL_SIZE_PER_DC,
         frag_tls: bool = False,
         prefer_port80_cf: bool = False,
+        allow_port80_fallback: bool = True,
         cf_ips: Optional[List[str]] = None,
         cf_ports: Optional[List[int]] = None,
     ):
@@ -1007,6 +1047,7 @@ class DcCarouselPool:
         self.pool_size = max(1, pool_size)
         self.frag_tls = frag_tls
         self.prefer_port80_cf = prefer_port80_cf
+        self.allow_port80_fallback = allow_port80_fallback
         self.ssl_ctx = _create_ssl_context()
         self.stats = CarouselStats()
 
@@ -1016,6 +1057,9 @@ class DcCarouselPool:
         self._endpoint_cooldown: Dict[Tuple[str, int], float] = {}
         self._endpoint_rtt: Dict[Tuple[str, int], float] = {}
         self._cf_domain_cooldown: Dict[str, float] = {}
+        self._worker_cooldown: Dict[str, float] = {}
+        self._worker_no_port80: Set[str] = set()
+        self._tls_timeout_streak = 0
         self._rr_cursor = 0
         self._cf_domain_cursor = 0
 
@@ -1220,6 +1264,29 @@ class DcCarouselPool:
         prev = self._endpoint_rtt.get(ep)
         self._endpoint_rtt[ep] = rtt if prev is None else (prev * 0.6 + rtt * 0.4)
 
+    def _mark_worker_rate_limited(self, domain: str) -> None:
+        """Put a rate-limited custom Worker domain (HTTP 429) on cooldown until UTC midnight."""
+        key = (domain or "").strip().lower()
+        if not key:
+            return
+        now_mono = time.monotonic()
+        if self._worker_cooldown.get(key, 0.0) > now_mono:
+            return
+        secs_until_utc_midnight = max(60.0, 86400.0 - (time.time() % 86400.0))
+        self._worker_cooldown[key] = now_mono + secs_until_utc_midnight
+        log.warning(
+            "Cloudflare Worker %s hit HTTP 429 daily limit; pausing for %.0fs until 00:00 UTC",
+            key,
+            secs_until_utc_midnight,
+        )
+
+    def _available_worker_domains(self) -> List[str]:
+        now = time.monotonic()
+        return [
+            d for d in self.worker_domains
+            if now >= self._worker_cooldown.get(d.lower(), 0.0)
+        ]
+
     async def _connect_socket(self, dc: int, is_test_dc: bool,
                               exclude: Optional[Set[Tuple[str, int]]] = None) -> EphemeralWorkerSocket:
         if not self.has_custom_worker:
@@ -1227,7 +1294,14 @@ class DcCarouselPool:
         dst_ip = self.resolve_dc_ip(dc, is_test_dc)
         last_exc: Optional[Exception] = None
         tried: Set[Tuple[str, int]] = set(exclude or ())
-        for _ in range(4):
+        avail_workers = self._available_worker_domains()
+        if not avail_workers:
+            raise WorkerRateLimitError("All custom Cloudflare Workers are in HTTP 429 cooldown")
+        for attempt in range(max(4, len(avail_workers))):
+            avail_workers = self._available_worker_domains()
+            if not avail_workers:
+                raise WorkerRateLimitError("All custom Cloudflare Workers are in HTTP 429 cooldown")
+            w_dom = avail_workers[attempt % len(avail_workers)]
             ep = self._pick_endpoint(exclude=tried)
             tried.add(ep)
             t0 = time.monotonic()
@@ -1237,7 +1311,7 @@ class DcCarouselPool:
                     dst_ip=dst_ip,
                     cf_ip=ep[0],
                     cf_port=ep[1],
-                    worker_domain=self.worker_domain,
+                    worker_domain=w_dom,
                     mode=self.active_mode,
                     ssl_ctx=self.ssl_ctx,
                     frag_tls=self.frag_tls,
@@ -1245,9 +1319,12 @@ class DcCarouselPool:
                 self._mark_endpoint_ok(ep, time.monotonic() - t0)
                 self.stats.sockets_opened += 1
                 return sock
-            except WorkerRateLimitError:
+            except WorkerRateLimitError as exc:
                 self.stats.sockets_failed += 1
-                raise
+                self._mark_worker_rate_limited(w_dom)
+                last_exc = exc
+                if not self._available_worker_domains():
+                    raise
             except Exception as exc:
                 self.stats.sockets_failed += 1
                 self._mark_endpoint_failed(ep)
@@ -1377,6 +1454,15 @@ class DcCarouselPool:
             f"All public CF {'Port 443' if use_tls else 'Port 80'} endpoints failed for DC{dc}"
         )
 
+    def _record_tls_result(self, *, tls_ok: bool, tls_timed_out: bool = False) -> None:
+        if tls_ok:
+            self._tls_timeout_streak = 0
+        elif tls_timed_out and self.allow_port80_fallback:
+            self._tls_timeout_streak += 1
+            if self._tls_timeout_streak >= 2 and not self.prefer_port80_cf:
+                self.prefer_port80_cf = True
+                log.info("Runtime auto-fallback: switching to CF Port 80 after repeated TLS timeouts")
+
     async def _connect_stream_socket(
         self,
         dc: int,
@@ -1388,7 +1474,7 @@ class DcCarouselPool:
         last_exc: Optional[Exception] = None
         can_cf_public = (not is_test_dc) and dc in (1, 2, 3, 4, 5, 203)
 
-        if self.prefer_port80_cf and can_cf_public:
+        if self.prefer_port80_cf and can_cf_public and not self.has_custom_worker:
             try:
                 return await self._connect_cf_public_socket(dc, dst_ip, use_tls=False)
             except Exception as exc:
@@ -1396,43 +1482,98 @@ class DcCarouselPool:
 
         if self.has_custom_worker:
             tried: Set[Tuple[str, int]] = set(exclude or ())
-            for attempt in range(4):
+            for attempt in range(max(4, len(self.worker_domains) * 2)):
+                avail_workers = self._available_worker_domains()
+                if not avail_workers:
+                    break
+                w_dom = avail_workers[attempt % len(avail_workers)]
                 ep = self._pick_endpoint(exclude=tried)
                 tried.add(ep)
-                w_dom = self.worker_domains[attempt % len(self.worker_domains)]
-                t0 = time.monotonic()
-                try:
-                    sock = await StreamingWorkerSocket.connect(
-                        dc=dc,
-                        dst_ip=dst_ip,
-                        cf_ip=ep[0],
-                        cf_port=ep[1],
-                        sni_host=w_dom,
-                        http_host=w_dom,
-                        path=f"/apiws?dst={dst_ip}&dc={dc}",
-                        is_cf_direct=False,
-                        ssl_ctx=self.ssl_ctx,
-                        frag_tls=self.frag_tls,
+                try_port80_first = (
+                    self.prefer_port80_cf
+                    and self.allow_port80_fallback
+                    and w_dom.lower() not in self._worker_no_port80
+                )
+                plans = (
+                    ((False, 80), (True, ep[1]))
+                    if try_port80_first
+                    else (
+                        ((True, ep[1]), (False, 80))
+                        if (self.allow_port80_fallback and w_dom.lower() not in self._worker_no_port80)
+                        else ((True, ep[1]),)
                     )
-                    self._mark_endpoint_ok(ep, time.monotonic() - t0)
-                    self.stats.sockets_opened += 1
-                    return sock
-                except WorkerRateLimitError:
-                    self.stats.sockets_failed += 1
-                    raise
-                except Exception as exc:
-                    self.stats.sockets_failed += 1
-                    self._mark_endpoint_failed(ep)
-                    last_exc = exc
+                )
+                tls_timed_out = False
+                for use_tls, cf_port in plans:
+                    if not use_tls and (not tls_timed_out and not try_port80_first):
+                        continue
+                    t0 = time.monotonic()
+                    try:
+                        sock = await StreamingWorkerSocket.connect(
+                            dc=dc,
+                            dst_ip=dst_ip,
+                            cf_ip=ep[0],
+                            cf_port=cf_port,
+                            sni_host=w_dom,
+                            http_host=w_dom,
+                            path=f"/apiws?dst={dst_ip}&dc={dc}",
+                            is_cf_direct=False,
+                            ssl_ctx=self.ssl_ctx,
+                            frag_tls=(self.frag_tls if use_tls else False),
+                            use_tls=use_tls,
+                        )
+                        self._mark_endpoint_ok((ep[0], cf_port), time.monotonic() - t0)
+                        if use_tls:
+                            self._record_tls_result(tls_ok=True)
+                        elif tls_timed_out:
+                            self._record_tls_result(tls_ok=False, tls_timed_out=True)
+                        self.stats.sockets_opened += 1
+                        return sock
+                    except WorkerRateLimitError as exc:
+                        self.stats.sockets_failed += 1
+                        self._mark_worker_rate_limited(w_dom)
+                        last_exc = exc
+                        break
+                    except UpstreamHttpRejectError as exc:
+                        self.stats.sockets_failed += 1
+                        last_exc = exc
+                        if not use_tls and exc.status in (301, 302, 307, 308, 403):
+                            self._worker_no_port80.add(w_dom.lower())
+                        else:
+                            self._mark_endpoint_failed((ep[0], cf_port))
+                    except (TimeoutError, asyncio.TimeoutError) as exc:
+                        self.stats.sockets_failed += 1
+                        self._mark_endpoint_failed((ep[0], cf_port))
+                        last_exc = exc
+                        if use_tls:
+                            tls_timed_out = True
+                    except Exception as exc:
+                        self.stats.sockets_failed += 1
+                        self._mark_endpoint_failed((ep[0], cf_port))
+                        last_exc = exc
 
         if can_cf_public:
-            try:
-                return await self._connect_cf_public_socket(dc, dst_ip, use_tls=True)
-            except Exception as exc:
-                last_exc = exc
-            if not self.prefer_port80_cf:
+            if self.prefer_port80_cf:
                 try:
                     return await self._connect_cf_public_socket(dc, dst_ip, use_tls=False)
+                except Exception as exc:
+                    last_exc = exc
+            tls_timed_out = False
+            try:
+                sock = await self._connect_cf_public_socket(dc, dst_ip, use_tls=True)
+                self._record_tls_result(tls_ok=True)
+                return sock
+            except (TimeoutError, asyncio.TimeoutError) as exc:
+                tls_timed_out = True
+                last_exc = exc
+            except Exception as exc:
+                last_exc = exc
+            if self.allow_port80_fallback:
+                try:
+                    sock = await self._connect_cf_public_socket(dc, dst_ip, use_tls=False)
+                    if tls_timed_out:
+                        self._record_tls_result(tls_ok=False, tls_timed_out=True)
+                    return sock
                 except Exception as exc:
                     last_exc = exc
 

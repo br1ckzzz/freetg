@@ -21,6 +21,7 @@ from .crypto import (
     generate_relay_init,
     read_mtproto_packet,
 )
+from .server import cancel_on_client_gone
 
 log = logging.getLogger("freetg.session")
 
@@ -83,9 +84,13 @@ class ClientSession:
         for attempt in range(3):
             if ws is None:
                 try:
-                    ws = await self.carousel._connect_stream_socket(
-                        self.hs.dc_id, self.hs.is_test_dc, exclude=excluded_eps
-                    )
+                    with cancel_on_client_gone(self.reader, self.writer):
+                        ws = await self.carousel._connect_stream_socket(
+                            self.hs.dc_id, self.hs.is_test_dc, exclude=excluded_eps
+                        )
+                except asyncio.CancelledError:
+                    log.debug("[%s] Client disconnected during DC%d stream reconnect", self.label, self.hs.dc_id)
+                    return
                 except Exception as exc:
                     log.warning("[%s] DC%d stream reconnect failed: %r", self.label, self.hs.dc_id, exc)
                     return
@@ -383,9 +388,13 @@ class ClientSession:
         try:
             ws = None
             try:
-                ws = await self.carousel.acquire_stream_socket(
-                    self.hs.dc_id, self.hs.is_test_dc
-                )
+                with cancel_on_client_gone(self.reader, self.writer):
+                    ws = await self.carousel.acquire_stream_socket(
+                        self.hs.dc_id, self.hs.is_test_dc
+                    )
+            except asyncio.CancelledError:
+                log.debug("[%s] Client disconnected while connecting DC%d stream", self.label, self.hs.dc_id)
+                return
             except Exception as exc:
                 log.warning(
                     "[%s] DC%d stream connect failed (%r), falling back to stateless carousel",
