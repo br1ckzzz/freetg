@@ -94,7 +94,7 @@ class CryptoUnitTests(unittest.TestCase):
                 self.assertEqual(parsed.proto_tag, tag)
 
     def test_public_pool_defaults_and_domain_parsing(self):
-        self.assertEqual(__version__, "0.2.0")
+        self.assertEqual(__version__, "0.2.1")
         self.assertEqual(DEFAULT_WORKER_DOMAIN, "")
         self.assertEqual(parse_worker_domains(""), [])
         self.assertEqual(
@@ -111,9 +111,26 @@ class CryptoUnitTests(unittest.TestCase):
             "worker_domain": "",
         })
         self.assertEqual(cfg.worker_domain, "")
+        self.assertFalse(cfg.prefer_port80_cf)
         pool = DcCarouselPool(cfg.worker_domain, mode="auto", pool_size=1)
         self.assertFalse(pool.has_custom_worker)
-        self.assertGreaterEqual(len(pool.public_domains), 20)
+        self.assertEqual(len(pool.public_domains), 20)
+        self.assertTrue(all(d.endswith(".co.uk") for d in pool.public_domains))
+
+        cfg_p80 = to_freetg_config({"bypass_mode": "port80"})
+        self.assertTrue(cfg_p80.prefer_port80_cf)
+        self.assertFalse(cfg_p80.frag_tls)
+
+        cfg_frag = to_freetg_config({"bypass_mode": "tls_frag"})
+        self.assertFalse(cfg_frag.prefer_port80_cf)
+        self.assertTrue(cfg_frag.frag_tls)
+
+    def test_domain_vs_endpoint_cooldown(self):
+        pool = DcCarouselPool("", mode="v1", pool_size=1)
+        pool.mark_domain_failed("kws203.lovetrue.co.uk")
+        self.assertIn("lovetrue.co.uk", pool._cf_domain_cooldown)
+        picked = pool._pick_public_domain(set())
+        self.assertNotEqual(picked, "lovetrue.co.uk")
 
     def test_packet_roundtrip(self):
         async def _run():

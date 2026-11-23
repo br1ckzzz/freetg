@@ -82,6 +82,7 @@ _PROXY_RESTART_KEYS = frozenset({
     "secret",
     "worker_domain",
     "mode",
+    "bypass_mode",
     "pool_size",
     "frag_tls",
     "builtin_desync",
@@ -546,7 +547,13 @@ class ProxyController:
                 return True, None
             self._last_error = None
 
-        if not cfg.get("builtin_desync", True):
+        bypass_mode = str(cfg.get("bypass_mode", "auto")).lower()
+        if bypass_mode == "windivert":
+            if cfg.get("builtin_desync", True) and not desync_manager.is_external_winws_running():
+                ok_w, err_w = desync_manager.start(str(cfg.get("worker_domain", "")))
+                if not ok_w and err_w:
+                    log.warning("Failed to start forced WinDivert bypass: %s", err_w)
+        elif bypass_mode in ("port80", "tls_frag", "direct") or not cfg.get("builtin_desync", True):
             desync_manager.stop()
 
         try:
@@ -672,7 +679,9 @@ class ProxyController:
         cfg: Dict[str, Any],
         on_notice: Optional[Callable[[Dict[str, Any], str], None]] = None,
     ) -> None:
-        """Probe TLS + 22KB stream and auto-enable TLS frag / built-in winws if TSPU blocks."""
+        """Probe TLS + 22KB stream and auto-enable TLS frag / CF Port 80 / built-in winws if TSPU blocks."""
+        if str(cfg.get("bypass_mode", "auto")).lower() != "auto":
+            return
         if not cfg.get("auto_tune", True):
             return
         if self._autotune_thread is not None and self._autotune_thread.is_alive():
@@ -688,13 +697,10 @@ class ProxyController:
             updated = False
             notes = []
 
-            if srv.carousel.frag_tls and not cfg.get("frag_tls", False):
-                cfg["frag_tls"] = True
-                save_config(cfg)
-                updated = True
+            if srv.carousel.frag_tls:
                 notes.append("включена фрагментация TLS")
 
-            # Check deep stream (>22KB) directly against DC2 using the live carousel settings
+            # Check deep stream (>22KB) on DC2 and verify DC203 using live carousel settings
             async def _probe_once(prefer_port80: bool = False) -> Tuple[bool, int, Optional[str]]:
                 probe_pool = DcCarouselPool(
                     worker_domain=srv.config.worker_domain,
@@ -707,10 +713,17 @@ class ProxyController:
                     await probe_pool.initialize()
                     if not prefer_port80 and probe_pool.frag_tls and not srv.carousel.frag_tls:
                         srv.carousel.frag_tls = True
-                        cfg["frag_tls"] = True
-                        save_config(cfg)
                         notes.append("включена фрагментация TLS")
-                    return await probe_pool.probe_deep_stream(dc=2, target_bytes=22000)
+                    deep_ok, sent_b, deep_err = await probe_pool.probe_deep_stream(dc=2, target_bytes=22000)
+                    if not deep_ok:
+                        return False, sent_b, deep_err
+                    try:
+                        _, err203 = await _probe_dc_via_worker(probe_pool, 203)
+                    except Exception as exc203:
+                        return False, sent_b, f"DC203: {exc203}"
+                    if err203 is not None:
+                        return False, sent_b, f"DC203: {err203}"
+                    return True, sent_b, None
                 finally:
                     await probe_pool.close()
 
@@ -885,12 +898,14 @@ async def test_worker_connectivity_async(
     mode: str,
     frag_tls: bool,
     *,
+    bypass_mode: str = "auto",
     builtin_desync: bool = True,
     auto_tune: bool = True,
     controller: Optional[ProxyController] = None,
 ) -> Tuple[str, bool]:
     domain = sanitize_worker_domain(worker_domain)
-    target_label = domain if domain else "публичный пул CF (23 домена)"
+    bmode = (bypass_mode or "auto").lower()
+    target_label = domain if domain else "публичный пул CF (20 доменов)"
 
     async def _run_suite(
         use_frag: bool, prefer_port80: bool = False
@@ -929,7 +944,7 @@ async def test_worker_connectivity_async(
                 fail_lines.insert(0, f"DC2 (>16 КБ): {deep_err or 'обрыв'}")
 
             return (
-                deep_ok,
+                deep_ok and not fail_lines,
                 ok_dcs,
                 fail_lines,
                 pool.active_mode.upper(),
@@ -941,41 +956,69 @@ async def test_worker_connectivity_async(
             await pool.close()
 
     try:
-        deep_ok, ok_dcs, fail_lines, mode_label, effective_frag, _, deep_err = await _run_suite(
-            frag_tls, prefer_port80=False
-        )
         winws_note = ""
-        if not deep_ok:
-            p80_res = await _run_suite(effective_frag, prefer_port80=True)
-            if p80_res[0]:
-                deep_ok, ok_dcs, fail_lines, mode_label, effective_frag, _, deep_err = p80_res
-                winws_note = ", CF Port 80 (без zapret)"
-                if controller is not None:
-                    with controller._lock:
-                        live_srv = controller._server
-                        live_loop = controller._loop
-                    if live_srv is not None:
-                        live_srv.carousel.prefer_port80_cf = True
-                        if live_loop is not None:
-                            try:
-                                asyncio.run_coroutine_threadsafe(
-                                    live_srv.carousel.flush_stream_idle(), live_loop
-                                )
-                            except RuntimeError:
-                                pass
-            elif builtin_desync and auto_tune and not desync_manager.is_external_winws_running():
+        if bmode == "port80":
+            deep_ok, ok_dcs, fail_lines, mode_label, effective_frag, _, deep_err = await _run_suite(
+                False, prefer_port80=True
+            )
+            winws_note = ", CF Port 80 (без zapret)"
+        elif bmode == "tls_frag":
+            deep_ok, ok_dcs, fail_lines, mode_label, effective_frag, _, deep_err = await _run_suite(
+                True, prefer_port80=False
+            )
+        elif bmode == "direct":
+            deep_ok, ok_dcs, fail_lines, mode_label, effective_frag, _, deep_err = await _run_suite(
+                False, prefer_port80=False
+            )
+            if desync_manager.is_external_winws_running():
+                winws_note = ", внешний zapret"
+        elif bmode == "windivert":
+            if builtin_desync and not desync_manager.is_external_winws_running():
                 ok_w, err_w = desync_manager.start(domain)
                 if ok_w:
                     winws_note = ", встроенный WinDivert"
-                    deep_ok, ok_dcs, fail_lines, mode_label, effective_frag, _, deep_err = await _run_suite(
-                        effective_frag, prefer_port80=False
-                    )
                 elif err_w:
-                    fail_lines.append(f"WinDivert: {err_w}")
-        elif desync_manager.is_external_winws_running():
-            winws_note = ", внешний zapret"
-        elif desync_manager.is_running():
-            winws_note = ", встроенный WinDivert"
+                    return f"✗ {target_label}: WinDivert не запущен — {err_w}", False
+            elif desync_manager.is_external_winws_running():
+                winws_note = ", внешний zapret"
+            deep_ok, ok_dcs, fail_lines, mode_label, effective_frag, _, deep_err = await _run_suite(
+                False, prefer_port80=False
+            )
+        else:
+            deep_ok, ok_dcs, fail_lines, mode_label, effective_frag, _, deep_err = await _run_suite(
+                frag_tls, prefer_port80=False
+            )
+            if not deep_ok:
+                p80_res = await _run_suite(False, prefer_port80=True)
+                if p80_res[0]:
+                    deep_ok, ok_dcs, fail_lines, mode_label, effective_frag, _, deep_err = p80_res
+                    winws_note = ", CF Port 80 (без zapret)"
+                    if controller is not None:
+                        with controller._lock:
+                            live_srv = controller._server
+                            live_loop = controller._loop
+                        if live_srv is not None:
+                            live_srv.carousel.prefer_port80_cf = True
+                            if live_loop is not None:
+                                try:
+                                    asyncio.run_coroutine_threadsafe(
+                                        live_srv.carousel.flush_stream_idle(), live_loop
+                                    )
+                                except RuntimeError:
+                                    pass
+                elif builtin_desync and auto_tune and not desync_manager.is_external_winws_running():
+                    ok_w, err_w = desync_manager.start(domain)
+                    if ok_w:
+                        winws_note = ", встроенный WinDivert"
+                        deep_ok, ok_dcs, fail_lines, mode_label, effective_frag, _, deep_err = await _run_suite(
+                            effective_frag, prefer_port80=False
+                        )
+                    elif err_w:
+                        fail_lines.append(f"WinDivert: {err_w}")
+            elif desync_manager.is_external_winws_running():
+                winws_note = ", внешний zapret"
+            elif desync_manager.is_running():
+                winws_note = ", встроенный WinDivert"
 
         frag_note = ", TLS-фраг вкл" if effective_frag else ""
         if deep_ok and len(ok_dcs) == 3:
@@ -1006,6 +1049,7 @@ class _ConnectivityWorker(QThread):
         frag_tls: bool,
         builtin_desync: bool,
         auto_tune: bool,
+        bypass_mode: str = "auto",
         controller: Optional[ProxyController] = None,
         parent: Optional[QObject] = None,
     ) -> None:
@@ -1015,6 +1059,7 @@ class _ConnectivityWorker(QThread):
         self._frag_tls = frag_tls
         self._builtin_desync = builtin_desync
         self._auto_tune = auto_tune
+        self._bypass_mode = bypass_mode
         self._controller = controller
 
     def run(self) -> None:
@@ -1026,6 +1071,7 @@ class _ConnectivityWorker(QThread):
                     self._domain,
                     self._mode,
                     self._frag_tls,
+                    bypass_mode=self._bypass_mode,
                     builtin_desync=self._builtin_desync,
                     auto_tune=self._auto_tune,
                     controller=self._controller,
@@ -1100,7 +1146,7 @@ class FirstRunDialog(QDialog):
         )
         title_lbl.setStyleSheet("font-size: 18px; font-weight: 700; color: #F8FAFC;")
         worker_lbl_txt = (
-            self._cfg.get("worker_domain") or "Публичный пул Cloudflare (23+ домена)"
+            self._cfg.get("worker_domain") or "Публичный пул Cloudflare (20+ доменов)"
         )
         sub_lbl = QLabel(f"Прокси запущен • {worker_lbl_txt}")
         sub_lbl.setWordWrap(True)
@@ -1370,8 +1416,23 @@ class SettingsDialog(QDialog):
 
         self.domain_edit = QLineEdit(str(self._cfg.get("worker_domain", DEFAULT_CONFIG["worker_domain"])))
         self.domain_edit.setMinimumWidth(120)
-        self.domain_edit.setPlaceholderText("Авто — публичный пул CF (23 домена)")
+        self.domain_edit.setPlaceholderText("Авто — публичный пул CF (20 доменов)")
         cf_layout.addWidget(self.domain_edit)
+
+        bypass_lbl = QLabel("Способ обхода:")
+        bypass_lbl.setStyleSheet("font-size: 11px; color: #94A3B8; font-weight: 600;")
+        cf_layout.addWidget(bypass_lbl)
+
+        self.bypass_combo = QComboBox()
+        self.bypass_combo.addItem("Автоподбор (Port 443 / Port 80 / WinDivert)", "auto")
+        self.bypass_combo.addItem("CF Port 80 (без TLS и без WinDivert)", "port80")
+        self.bypass_combo.addItem("Встроенный WinDivert (winws.exe)", "windivert")
+        self.bypass_combo.addItem("Фрагментация TLS ClientHello (порт 443)", "tls_frag")
+        self.bypass_combo.addItem("Прямой / Внешний zapret (порт 443)", "direct")
+        cur_bypass = str(self._cfg.get("bypass_mode", "auto")).lower()
+        b_idx = self.bypass_combo.findData(cur_bypass)
+        self.bypass_combo.setCurrentIndex(max(0, b_idx))
+        cf_layout.addWidget(self.bypass_combo)
 
         dom_btns = _FlowLayout(spacing=6)
         self.test_btn = _make_btn("Тест соединения", min_width=120)
@@ -1581,6 +1642,7 @@ class SettingsDialog(QDialog):
             self.frag_cb.isChecked(),
             self.builtin_desync_cb.isChecked(),
             self.auto_tune_cb.isChecked(),
+            bypass_mode=str(self.bypass_combo.currentData()),
             controller=self._controller,
             parent=self,
         )
@@ -1624,6 +1686,7 @@ class SettingsDialog(QDialog):
             "secret": secret,
             "worker_domain": worker_domain,
             "mode": str(self.mode_combo.currentData()),
+            "bypass_mode": str(self.bypass_combo.currentData()),
             "pool_size": int(self.pool_spin.value()),
             "frag_tls": self.frag_cb.isChecked(),
             "builtin_desync": self.builtin_desync_cb.isChecked(),

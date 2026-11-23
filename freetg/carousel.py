@@ -70,9 +70,6 @@ CF_FALLBACK_DOMAINS: Tuple[str, ...] = (
     "onedaychamp.co.uk",
     "stopblocking.co.uk",
     "nothingthere.co.uk",
-    "hssv43.eu.cc",
-    "nl4tgws.eu.cc",
-    "ntsl4.eu.cc",
 )
 CF_PUBLIC_DOMAINS = CF_FALLBACK_DOMAINS
 CF_PUBLIC_DOMAINS_URL = (
@@ -122,7 +119,7 @@ def _decode_cfproxy_entry(entry: str) -> str:
 def _fetch_remote_public_domains_sync() -> List[str]:
     req = urllib.request.Request(
         CF_PUBLIC_DOMAINS_URL,
-        headers={"User-Agent": "FreeTG/0.2.0"},
+        headers={"User-Agent": "FreeTG/0.2.1"},
     )
     with urllib.request.urlopen(req, timeout=6.0) as resp:
         raw = resp.read().decode("utf-8", errors="replace")
@@ -183,6 +180,14 @@ class UpstreamTransportError(ConnectionError):
     def __init__(self, code: int, message: str):
         super().__init__(message)
         self.code = code
+
+
+class UpstreamHttpRejectError(ConnectionError):
+    """Raised when the CF/Worker endpoint responds with non-101 HTTP status."""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
 
 
 @dataclass
@@ -278,20 +283,23 @@ class _FragmentedTlsReader:
     """Async reader adapter over an ssl.SSLObject + MemoryBIO."""
 
     def __init__(self, raw_reader: asyncio.StreamReader, raw_writer: asyncio.StreamWriter,
-                 sslobj: ssl.SSLObject, inc: ssl.MemoryBIO, outg: ssl.MemoryBIO):
+                 sslobj: ssl.SSLObject, inc: ssl.MemoryBIO, outg: ssl.MemoryBIO,
+                 drain_lock: Optional[asyncio.Lock] = None):
         self._raw_r = raw_reader
         self._raw_w = raw_writer
         self._ssl = sslobj
         self._inc = inc
         self._outg = outg
+        self._drain_lock = drain_lock or asyncio.Lock()
         self._buf = bytearray()
         self._eof = False
 
     async def _flush_out(self) -> None:
-        data = self._outg.read()
-        if data:
-            self._raw_w.write(data)
-            await self._raw_w.drain()
+        async with self._drain_lock:
+            data = self._outg.read()
+            if data:
+                self._raw_w.write(data)
+                await self._raw_w.drain()
 
     async def read(self, n: int = 65536) -> bytes:
         if self._buf:
@@ -334,10 +342,12 @@ class _FragmentedTlsWriter:
     """Async writer adapter over an ssl.SSLObject + MemoryBIO."""
 
     def __init__(self, raw_writer: asyncio.StreamWriter,
-                 sslobj: ssl.SSLObject, outg: ssl.MemoryBIO):
+                 sslobj: ssl.SSLObject, outg: ssl.MemoryBIO,
+                 drain_lock: Optional[asyncio.Lock] = None):
         self._raw_w = raw_writer
         self._ssl = sslobj
         self._outg = outg
+        self._drain_lock = drain_lock or asyncio.Lock()
         self._closing = False
 
     def write(self, data: bytes) -> None:
@@ -345,10 +355,11 @@ class _FragmentedTlsWriter:
             self._ssl.write(data)
 
     async def drain(self) -> None:
-        data = self._outg.read()
-        if data:
-            self._raw_w.write(data)
-            await self._raw_w.drain()
+        async with self._drain_lock:
+            data = self._outg.read()
+            if data:
+                self._raw_w.write(data)
+                await self._raw_w.drain()
 
     def close(self) -> None:
         self._closing = True
@@ -390,16 +401,19 @@ async def _open_tls_socket(
 
     ch = outg.read()
     if ch and ch[0] == 0x16 and len(ch) > 5:
-        ver = ch[1:3]
+        # Split the single TLS ClientHello record across two TCP segments around SNI.
+        # Splitting at the TCP layer preserves a valid TLS record for strict proxies
+        # while still breaking up the SNI for DPI/TSPU inspection.
         payload = ch[5:]
         sni_bytes = server_hostname.encode("ascii", errors="ignore")
         sni_pos = payload.find(sni_bytes) if sni_bytes else -1
 
-        cut = (sni_pos + max(2, len(sni_bytes) // 2)) if sni_pos >= 0 else max(1, len(payload) // 2)
-        frags: List[bytes] = [
-            b"\x16" + ver + struct.pack(">H", cut) + payload[:cut],
-            b"\x16" + ver + struct.pack(">H", len(payload) - cut) + payload[cut:],
-        ]
+        cut = 5 + (
+            (sni_pos + max(2, len(sni_bytes) // 2))
+            if sni_pos >= 0
+            else max(2, len(payload) // 2)
+        )
+        frags: List[bytes] = [ch[:cut], ch[cut:]]
 
         for i, frag in enumerate(frags):
             raw_w.write(frag)
@@ -432,7 +446,11 @@ async def _open_tls_socket(
             raw_w.close()
             raise
 
-    return _FragmentedTlsReader(raw_r, raw_w, sslobj, inc, outg), _FragmentedTlsWriter(raw_w, sslobj, outg)
+    drain_lock = asyncio.Lock()
+    return (
+        _FragmentedTlsReader(raw_r, raw_w, sslobj, inc, outg, drain_lock=drain_lock),
+        _FragmentedTlsWriter(raw_w, sslobj, outg, drain_lock=drain_lock),
+    )
 
 
 class _BaseWsSocket:
@@ -624,7 +642,7 @@ class StreamingWorkerSocket(_BaseWsSocket):
             if status == 429:
                 raise WorkerRateLimitError("Cloudflare Worker returned HTTP 429")
             if status != 101:
-                raise ConnectionError(f"Stream WS upgrade failed with HTTP {status}")
+                raise UpstreamHttpRejectError(status, f"Stream WS upgrade failed with HTTP {status}")
             return cls(
                 dc=dc,
                 dst_ip=dst_ip,
@@ -1042,8 +1060,9 @@ class DcCarouselPool:
                 log.debug("DNS resolution for %s skipped: %r", self.worker_domain, exc)
 
         if not self.frag_tls and not self.prefer_port80_cf:
-            if not await self._check_tls_reachable(frag_tls=False):
-                if await self._check_tls_reachable(frag_tls=True):
+            probe_eps = list(self._endpoints[:3])
+            if not await self._check_tls_reachable(frag_tls=False, endpoints=probe_eps):
+                if await self._check_tls_reachable(frag_tls=True, endpoints=probe_eps):
                     self.frag_tls = True
                     log.info(
                         "Auto-enabled TLS ClientHello fragmentation for %s",
@@ -1075,10 +1094,12 @@ class DcCarouselPool:
         for dc in (2, 4, 203):
             self._schedule_stream_refill(dc, False)
 
-    async def _check_tls_reachable(self, *, frag_tls: bool) -> bool:
+    async def _check_tls_reachable(
+        self, *, frag_tls: bool, endpoints: Optional[List[Tuple[str, int]]] = None
+    ) -> bool:
         sni_host = self.worker_domain if self.has_custom_worker else f"kws2.{self.public_domains[0]}"
-        for _ in range(min(2, len(self._endpoints))):
-            ip, port = self._pick_endpoint()
+        eps = endpoints if endpoints is not None else list(self._endpoints[:3])
+        for ip, port in eps:
             try:
                 reader, writer = await _open_tls_socket(
                     ip, port, sni_host, self.ssl_ctx, 2.5, frag_tls=frag_tls
@@ -1273,6 +1294,16 @@ class DcCarouselPool:
         for dc in (2, 4, 203):
             self._schedule_stream_refill(dc, False)
 
+    def mark_domain_failed(self, host: str) -> None:
+        """Put a public CF domain on cooldown after HTTP rejection or silent upstream drop."""
+        h = (host or "").strip().lower()
+        if not h or "." not in h:
+            return
+        parts = h.split(".", 1)
+        if parts[0].startswith("kws") and parts[0][3:].isdigit():
+            h = parts[1]
+        self._cf_domain_cooldown[h] = time.monotonic() + CF_DOMAIN_COOLDOWN_SECONDS
+
     def _pick_public_domain(self, tried: Set[str]) -> str:
         now = time.monotonic()
         domains = self.public_domains
@@ -1292,15 +1323,18 @@ class DcCarouselPool:
         """Connect over public Cloudflare proxy domains (Port 443 TLS or Port 80 ws://)."""
         last_exc: Optional[Exception] = None
         cf_port = 443 if use_tls else 80
+        now = time.monotonic()
         fast_ips = list(dict.fromkeys(
             ep[0] for ep, _ in sorted(self._endpoint_rtt.items(), key=lambda kv: kv[1])
         ))
-        candidate_ips = fast_ips + [ip for ip in CF_ANYCAST_IPS if ip not in fast_ips]
+        all_ips = fast_ips + [ip for ip in CF_ANYCAST_IPS if ip not in fast_ips]
+        healthy_ips = [ip for ip in all_ips if now >= self._endpoint_cooldown.get((ip, cf_port), 0.0)]
+        candidate_ips = healthy_ips or all_ips
+
         tried_domains: Set[str] = set()
-        attempts = min(6, max(4, len(self.public_domains)))
+        attempts = min(8, max(6, len(self.public_domains)))
         for attempt in range(attempts):
             base_domain = self._pick_public_domain(tried_domains)
-            tried_domains.add(base_domain)
             cf_ip = candidate_ips[attempt % len(candidate_ips)]
             cf_host = f"kws{dc}.{base_domain}"
             t0 = time.monotonic()
@@ -1319,8 +1353,7 @@ class DcCarouselPool:
                     use_tls=use_tls,
                 )
                 self._cf_domain_cooldown.pop(base_domain, None)
-                if use_tls:
-                    self._mark_endpoint_ok((cf_ip, cf_port), time.monotonic() - t0)
+                self._mark_endpoint_ok((cf_ip, cf_port), time.monotonic() - t0)
                 self.stats.sockets_opened += 1
                 log.info(
                     "Stream DC%d connected via CF %s %s (%s:%d)",
@@ -1331,9 +1364,14 @@ class DcCarouselPool:
                     cf_port,
                 )
                 return sock
+            except (WorkerRateLimitError, UpstreamHttpRejectError) as exc:
+                self.stats.sockets_failed += 1
+                tried_domains.add(base_domain)
+                self._cf_domain_cooldown[base_domain] = time.monotonic() + CF_DOMAIN_COOLDOWN_SECONDS
+                last_exc = exc
             except Exception as exc:
                 self.stats.sockets_failed += 1
-                self._cf_domain_cooldown[base_domain] = time.monotonic() + CF_DOMAIN_COOLDOWN_SECONDS
+                self._mark_endpoint_failed((cf_ip, cf_port))
                 last_exc = exc
         raise last_exc or ConnectionError(
             f"All public CF {'Port 443' if use_tls else 'Port 80'} endpoints failed for DC{dc}"

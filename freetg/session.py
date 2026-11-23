@@ -167,6 +167,8 @@ class ClientSession:
                             if idle_since_tx < threshold:
                                 continue
                             self.carousel._mark_endpoint_failed(ws.endpoint)
+                            if ws.is_cf_direct:
+                                self.carousel.mark_domain_failed(ws.host)
                             raise TimeoutError("No initial response from upstream DC")
                         silent_pings += 1
                         if silent_pings > WS_MAX_SILENT_PINGS:
@@ -211,6 +213,9 @@ class ClientSession:
                 ):
                     should_retry = True
                     excluded_eps.add(ws.endpoint)
+                    self.carousel._mark_endpoint_failed(ws.endpoint)
+                    if ws.is_cf_direct:
+                        self.carousel.mark_domain_failed(ws.host)
                     log.debug("[%s] DC%d upstream closed before first byte (%s:%d), retrying fresh socket",
                               self.label, self.hs.dc_id, ws.cf_ip, ws.cf_port)
             finally:
@@ -391,8 +396,10 @@ class ClientSession:
 
             if ws is not None:
                 await self._run_streaming(ws)
-            else:
+            elif self.carousel.has_custom_worker:
                 await self._run_stateless_carousel()
+            else:
+                log.debug("[%s] DC%d stream unavailable and no custom Worker for stateless fallback", self.label, self.hs.dc_id)
         finally:
             self.close_now()
             try:

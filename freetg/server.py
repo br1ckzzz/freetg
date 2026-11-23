@@ -42,6 +42,7 @@ class FreeTGConfig:
     mode: str = "auto"
     pool_size: int = DEFAULT_POOL_SIZE_PER_DC
     frag_tls: bool = False
+    prefer_port80_cf: bool = False
     stats_interval: float = 30.0
     verbose: bool = False
 
@@ -58,6 +59,7 @@ class FreeTGProxyServer:
             mode=config.mode,
             pool_size=config.pool_size,
             frag_tls=config.frag_tls,
+            prefer_port80_cf=config.prefer_port80_cf,
         )
         self._servers: List[asyncio.AbstractServer] = []
         self._client_tasks: Set[asyncio.Task] = set()
@@ -155,9 +157,12 @@ class FreeTGProxyServer:
         log.info("=" * 64)
         log.info("  FreeTG - Ephemeral Carousel MTProto Proxy")
         log.info("  AES backend   : %s", AES_BACKEND_NAME)
-        worker_label = self.config.worker_domain or "public CF pool (23+ domains)"
+        worker_label = self.config.worker_domain or "public CF pool (20+ domains)"
         log.info("  Worker domain : %s (mode=%s)", worker_label, self.carousel.active_mode.upper())
-        log.info("  TLS Frag      : %s", "enabled" if self.config.frag_tls else "off")
+        log.info(
+            "  Bypass        : %s",
+            "CF Port 80 (ws)" if self.config.prefer_port80_cf else ("TLS Frag" if self.config.frag_tls else "direct/auto"),
+        )
         log.info("  Pool per DC   : %d pre-warmed sockets", self.config.pool_size)
         for port in self.config.ports:
             link = (

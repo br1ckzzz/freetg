@@ -31,6 +31,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "secret": DEFAULT_SECRET,
     "worker_domain": DEFAULT_WORKER_DOMAIN,
     "mode": "auto",
+    "bypass_mode": "auto",
     "pool_size": 3,
     "frag_tls": False,
     "builtin_desync": True,
@@ -188,6 +189,21 @@ def to_freetg_config(cfg: Dict[str, Any], *, stats_interval: float = 30.0) -> Fr
     mode = str(cfg.get("mode", "auto")).lower()
     if mode not in ("auto", "v1", "v2"):
         mode = "auto"
+    bypass_mode = str(cfg.get("bypass_mode", "auto")).lower()
+    if bypass_mode not in ("auto", "port80", "windivert", "tls_frag", "direct"):
+        bypass_mode = "auto"
+    if bypass_mode == "port80":
+        frag_tls = False
+        prefer_port80_cf = True
+    elif bypass_mode == "tls_frag":
+        frag_tls = True
+        prefer_port80_cf = False
+    elif bypass_mode in ("windivert", "direct"):
+        frag_tls = False
+        prefer_port80_cf = False
+    else:
+        frag_tls = bool(cfg.get("frag_tls", False))
+        prefer_port80_cf = False
     return FreeTGConfig(
         host=str(cfg.get("host", "127.0.0.1")).strip() or "127.0.0.1",
         ports=[int(cfg.get("port", 1080))],
@@ -195,7 +211,8 @@ def to_freetg_config(cfg: Dict[str, Any], *, stats_interval: float = 30.0) -> Fr
         worker_domain=domain,
         mode=mode,
         pool_size=max(0, min(10, int(cfg.get("pool_size", 3)))),
-        frag_tls=bool(cfg.get("frag_tls", False)),
+        frag_tls=frag_tls,
+        prefer_port80_cf=prefer_port80_cf,
         stats_interval=stats_interval,
         verbose=bool(cfg.get("verbose", False)),
     )
