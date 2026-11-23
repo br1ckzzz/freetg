@@ -119,7 +119,7 @@ def _decode_cfproxy_entry(entry: str) -> str:
 def _fetch_remote_public_domains_sync() -> List[str]:
     req = urllib.request.Request(
         CF_PUBLIC_DOMAINS_URL,
-        headers={"User-Agent": "FreeTG/0.3.0-z2lite"},
+        headers={"User-Agent": "FreeTG/0.3.0-z2ab"},
     )
     with urllib.request.urlopen(req, timeout=6.0) as resp:
         raw = resp.read().decode("utf-8", errors="replace")

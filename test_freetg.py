@@ -18,6 +18,7 @@ from freetg.desync import (
     _WINWS_EXE_NAMES,
     _build_zapret2_args,
     _build_zapret1_args,
+    has_bundled_engine,
 )
 from freetg.crypto import (
     AesCtr,
@@ -109,7 +110,7 @@ class CryptoUnitTests(unittest.TestCase):
                 self.assertEqual(parsed.proto_tag, tag)
 
     def test_public_pool_defaults_and_domain_parsing(self):
-        self.assertEqual(__version__, "0.3.0-z2lite")
+        self.assertEqual(__version__, "0.3.0-z2ab")
         self.assertEqual(DEFAULT_WORKER_DOMAIN, "")
         self.assertEqual(parse_worker_domains(""), [])
         self.assertEqual(
@@ -281,6 +282,8 @@ class CryptoUnitTests(unittest.TestCase):
             args_v1 = _build_zapret1_args(td, "proxy.example.com")
             self.assertIn("--dpi-desync", args_v1)
 
+        self.assertTrue(has_bundled_engine("zapret2"))
+        self.assertTrue(has_bundled_engine("zapret1"))
         mgr = BuiltinDesyncManager()
         self.assertIn("winws2", repr(mgr) + "winws2")
 
@@ -300,6 +303,7 @@ class CryptoUnitTests(unittest.TestCase):
             fr.win.destroy()
 
             sd = SettingsDialog(root, dict(DEFAULT_CONFIG), ctrl, lambda c, r: None)
+            self.assertIn("windivert1", [k for k, _ in sd._bypass_items])
             sd.win.geometry("380x440")
             sd.win.update()
             self.assertGreaterEqual(sd.win.winfo_width(), 380)
