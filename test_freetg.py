@@ -20,6 +20,7 @@ from freetg.desync import (
     _build_zapret1_args,
     has_bundled_engine,
 )
+from freetg.updater import is_newer_version, parse_release_payload, parse_version
 from freetg.crypto import (
     AesCtr,
     PROTO_TAG_ABRIDGED,
@@ -290,7 +291,8 @@ class CryptoUnitTests(unittest.TestCase):
     def test_tkinter_dialogs_smoke_at_380px(self):
         import tkinter as tk
         from freetg.app_config import DEFAULT_CONFIG
-        from freetg.tray_app import FirstRunDialog, ProxyController, SettingsDialog
+        from freetg.tray_app import FirstRunDialog, ProxyController, SettingsDialog, UpdateDialog
+        from freetg.updater import UpdateInfo
 
         root = tk.Tk()
         root.withdraw()
@@ -308,8 +310,50 @@ class CryptoUnitTests(unittest.TestCase):
             sd.win.update()
             self.assertGreaterEqual(sd.win.winfo_width(), 380)
             sd.win.destroy()
+
+            upd = UpdateInfo(
+                tag="v0.4.0",
+                version="0.4.0",
+                html_url="https://github.com/br1ckzzz/freetg/releases/tag/v0.4.0",
+                download_url="https://github.com/br1ckzzz/freetg/releases/download/v0.4.0/FreeTG.exe",
+                notes_summary="Новые возможности",
+                published_at="2026-11-23T20:00:00Z",
+            )
+            ud = UpdateDialog(root, upd)
+            ud.win.update()
+            self.assertGreaterEqual(ud.win.winfo_width(), 380)
+            ud.win.destroy()
         finally:
             root.destroy()
+
+    def test_updater_version_comparison_and_payload(self):
+        self.assertGreater(parse_version("v0.3.0"), parse_version("0.3.0-z2lite"))
+        self.assertGreater(parse_version("0.3.0-z2lite"), parse_version("0.2.2"))
+        self.assertTrue(is_newer_version("v0.3.0", "0.3.0-z2lite"))
+        self.assertTrue(is_newer_version("v0.3.1", "0.3.0"))
+        self.assertFalse(is_newer_version("v0.2.2", "0.3.0-z2lite"))
+        self.assertFalse(is_newer_version("v0.3.0-z2lite", "0.3.0-z2lite"))
+        self.assertFalse(is_newer_version("invalid-tag", "0.1.0"))
+
+        payload = {
+            "tag_name": "v0.4.0",
+            "draft": False,
+            "html_url": "https://github.com/br1ckzzz/freetg/releases/tag/v0.4.0",
+            "published_at": "2026-11-23T21:00:00Z",
+            "body": "## FreeTG v0.4.0\n- Улучшен обход ТСПУ\n### Проверка целостности (`FreeTG.exe`)\n- SHA256: abc",
+            "assets": [
+                {"name": "FreeTG.exe", "browser_download_url": "https://example.com/FreeTG.exe"}
+            ],
+        }
+        info = parse_release_payload(payload, current_version="0.3.0-z2lite")
+        self.assertIsNotNone(info)
+        self.assertEqual(info.tag, "v0.4.0")
+        self.assertEqual(info.download_url, "https://example.com/FreeTG.exe")
+        self.assertIn("Улучшен обход ТСПУ", info.notes_summary)
+        self.assertNotIn("SHA256", info.notes_summary)
+
+        self.assertIsNone(parse_release_payload({**payload, "draft": True}, current_version="0.1.0"))
+        self.assertIsNone(parse_release_payload({**payload, "tag_name": "v0.2.2"}, current_version="0.3.0-z2lite"))
 
     def test_packet_roundtrip(self):
         async def _run():
