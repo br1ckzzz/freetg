@@ -1,4 +1,4 @@
-"""PyQt6 System Tray, Settings UI, and First-Run assistant for FreeTG."""
+"""Lightweight tkinter + native Win32 System Tray UI and ProxyController for FreeTG."""
 
 from __future__ import annotations
 
@@ -6,48 +6,21 @@ import asyncio
 import ctypes
 import logging
 import os
+import queue
 import socket
 import struct
 import sys
 import threading
 import time
-import webbrowser
+import tkinter as tk
 from copy import deepcopy
-from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
-
-from PyQt6.QtCore import QObject, QPoint, QRect, QSize, Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QIcon, QPainter, QPainterPath, QPixmap
-from PyQt6.QtWidgets import (
-    QApplication,
-    QCheckBox,
-    QComboBox,
-    QDialog,
-    QDoubleSpinBox,
-    QFormLayout,
-    QFrame,
-    QGroupBox,
-    QHBoxLayout,
-    QLabel,
-    QLayout,
-    QLayoutItem,
-    QLineEdit,
-    QMenu,
-    QMessageBox,
-    QPushButton,
-    QScrollArea,
-    QSizePolicy,
-    QSpinBox,
-    QSystemTrayIcon,
-    QTabWidget,
-    QVBoxLayout,
-    QWidget,
-)
+from tkinter import messagebox, ttk
+from typing import Any, Callable, Dict, List, Optional, Tuple
+import webbrowser
 
 from . import __version__
 from .app_config import (
     APP_NAME,
-    CONFIG_FILE,
     DEFAULT_CONFIG,
     FIRST_RUN_MARKER,
     LOG_FILE,
@@ -71,10 +44,32 @@ from .crypto import (
     generate_relay_init,
     normalize_secret,
 )
-from .desync import desync_manager
+from .desync import (
+    ZAPRET2_PROFILE_LABELS,
+    ZAPRET2_PROFILE_ORDER,
+    desync_manager,
+    has_bundled_engine,
+)
 from .server import FreeTGProxyServer, _human_bytes
+from .win_tray import Win32TrayIcon, apply_dark_titlebar, enable_high_dpi
 
 log = logging.getLogger("freetg.tray")
+
+_BG = "#0B1120"
+_CARD_BG = "#121B2E"
+_CARD_BORDER = "#1E2D45"
+_INPUT_BG = "#0F172A"
+_INPUT_BORDER = "#26354D"
+_TEXT = "#E2E8F0"
+_MUTED = "#94A3B8"
+_DIM = "#64748B"
+_ACCENT = "#10B981"
+_ACCENT_HOVER = "#34D399"
+_ACCENT_TEXT = "#052E16"
+_BTN_BG = "#182338"
+_BTN_HOVER = "#22304A"
+_DANGER_BG = "#23141B"
+_DANGER_FG = "#FCA5A5"
 
 _PROXY_RESTART_KEYS = frozenset({
     "host",
@@ -83,273 +78,12 @@ _PROXY_RESTART_KEYS = frozenset({
     "worker_domain",
     "mode",
     "bypass_mode",
+    "desync_profile",
     "pool_size",
     "frag_tls",
     "builtin_desync",
     "auto_tune",
 })
-
-_APP_STYLESHEET = """
-QDialog, QWidget {
-    background-color: #0B1120;
-    color: #E2E8F0;
-    font-family: "Segoe UI", sans-serif;
-    font-size: 13px;
-}
-QScrollArea, QScrollArea > QWidget > QWidget {
-    background-color: transparent;
-    border: none;
-}
-QGroupBox {
-    background-color: #121B2E;
-    border: 1px solid #1E2D45;
-    border-radius: 10px;
-    margin-top: 12px;
-    padding: 14px 12px 10px 12px;
-    font-weight: 600;
-    color: #94A3B8;
-}
-QGroupBox::title {
-    subcontrol-origin: margin;
-    subcontrol-position: top left;
-    left: 12px;
-    padding: 0 6px;
-    color: #34D399;
-    font-size: 12px;
-}
-QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
-    background-color: #0F172A;
-    border: 1px solid #26354D;
-    border-radius: 7px;
-    padding: 6px 9px;
-    min-height: 18px;
-    color: #F8FAFC;
-    selection-background-color: #10B981;
-}
-QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
-    border: 1px solid #10B981;
-}
-QComboBox::drop-down {
-    border: none;
-    width: 24px;
-}
-QComboBox QAbstractItemView {
-    background-color: #0F172A;
-    border: 1px solid #26354D;
-    selection-background-color: #059669;
-    color: #F8FAFC;
-}
-QCheckBox {
-    spacing: 8px;
-    color: #E2E8F0;
-}
-QCheckBox::indicator {
-    width: 16px;
-    height: 16px;
-    border-radius: 4px;
-    border: 1px solid #3B5275;
-    background-color: #0F172A;
-}
-QCheckBox::indicator:checked {
-    background-color: #10B981;
-    border: 1px solid #10B981;
-}
-QPushButton {
-    background-color: #182338;
-    border: 1px solid #2A3B58;
-    border-radius: 7px;
-    padding: 6px 14px;
-    min-height: 20px;
-    color: #E2E8F0;
-    font-weight: 500;
-}
-QPushButton:hover {
-    background-color: #22304A;
-    border-color: #3B5275;
-}
-QPushButton:pressed {
-    background-color: #131C2E;
-}
-QPushButton:disabled {
-    color: #64748B;
-    border-color: #1E293B;
-}
-QPushButton#primaryBtn {
-    background-color: #10B981;
-    border: 1px solid #10B981;
-    color: #052E16;
-    font-weight: 700;
-}
-QPushButton#primaryBtn:hover {
-    background-color: #34D399;
-    border-color: #34D399;
-}
-QPushButton#primaryBtn:pressed {
-    background-color: #059669;
-}
-QPushButton#dangerBtn {
-    background-color: #1E151B;
-    border: 1px solid #7F1D1D;
-    color: #FCA5A5;
-}
-QPushButton#dangerBtn:hover {
-    background-color: #2C1820;
-    border-color: #991B1B;
-}
-QPushButton#linkBtn {
-    background-color: transparent;
-    border: none;
-    color: #94A3B8;
-    padding: 4px 2px;
-    text-align: left;
-    font-weight: 600;
-}
-QPushButton#linkBtn:hover {
-    color: #34D399;
-}
-QTabWidget::pane {
-    border: 1px solid #1E2D45;
-    border-radius: 9px;
-    background-color: #121B2E;
-    padding: 12px;
-}
-QTabBar::tab {
-    background-color: #0F172A;
-    border: 1px solid #1E2D45;
-    border-bottom: none;
-    border-top-left-radius: 7px;
-    border-top-right-radius: 7px;
-    padding: 7px 14px;
-    margin-right: 4px;
-    color: #94A3B8;
-    font-weight: 600;
-}
-QTabBar::tab:selected {
-    background-color: #10B981;
-    border-color: #10B981;
-    color: #052E16;
-}
-QMenu {
-    background-color: #121B2E;
-    border: 1px solid #26354D;
-    padding: 4px;
-    color: #E2E8F0;
-}
-QMenu::item {
-    padding: 6px 18px 6px 14px;
-    border-radius: 5px;
-}
-QMenu::item:selected {
-    background-color: #10B981;
-    color: #052E16;
-}
-QMenu::separator {
-    height: 1px;
-    background-color: #1E2D45;
-    margin: 4px 8px;
-}
-"""
-
-
-class _FlowLayout(QLayout):
-    """Responsive wrapping layout so buttons stay cleanly sized at any width."""
-
-    def __init__(self, parent: Optional[QWidget] = None, spacing: int = 8) -> None:
-        super().__init__(parent)
-        self._items: List[QLayoutItem] = []
-        self.setSpacing(spacing)
-        self.setContentsMargins(0, 0, 0, 0)
-
-    def __del__(self) -> None:
-        item = self.takeAt(0)
-        while item is not None:
-            item = self.takeAt(0)
-
-    def addItem(self, item: QLayoutItem) -> None:
-        self._items.append(item)
-
-    def count(self) -> int:
-        return len(self._items)
-
-    def itemAt(self, index: int) -> Optional[QLayoutItem]:
-        if 0 <= index < len(self._items):
-            return self._items[index]
-        return None
-
-    def takeAt(self, index: int) -> Optional[QLayoutItem]:
-        if 0 <= index < len(self._items):
-            return self._items.pop(index)
-        return None
-
-    def expandingDirections(self) -> Qt.Orientation:
-        return Qt.Orientation(0)
-
-    def hasHeightForWidth(self) -> bool:
-        return True
-
-    def heightForWidth(self, width: int) -> int:
-        return self._do_layout(QRect(0, 0, width, 0), test_only=True)
-
-    def setGeometry(self, rect: QRect) -> None:
-        super().setGeometry(rect)
-        self._do_layout(rect, test_only=False)
-
-    def sizeHint(self) -> QSize:
-        return self.minimumSize()
-
-    def minimumSize(self) -> QSize:
-        size = QSize()
-        for item in self._items:
-            w = item.widget()
-            if w is not None and not w.isVisible():
-                continue
-            size = size.expandedTo(item.minimumSize())
-        left, top, right, bottom = self.getContentsMargins()
-        return size + QSize(left + right, top + bottom)
-
-    def _do_layout(self, rect: QRect, test_only: bool) -> int:
-        left, top, right, bottom = self.getContentsMargins()
-        effective = rect.adjusted(left, top, -right, -bottom)
-        x = effective.x()
-        y = effective.y()
-        line_height = 0
-        spacing = max(6, self.spacing())
-
-        for item in self._items:
-            w = item.widget()
-            if w is not None and not w.isVisible():
-                continue
-            hint = item.sizeHint().expandedTo(item.minimumSize())
-            next_x = x + hint.width() + spacing
-            if next_x - spacing > effective.right() and line_height > 0:
-                x = effective.x()
-                y = y + line_height + spacing
-                next_x = x + hint.width() + spacing
-                line_height = 0
-            if not test_only:
-                item.setGeometry(QRect(QPoint(x, y), hint))
-            x = next_x
-            line_height = max(line_height, hint.height())
-        return y + line_height - rect.y() + bottom
-
-
-def _make_btn(
-    text: str,
-    *,
-    object_name: Optional[str] = None,
-    min_width: int = 0,
-    tooltip: Optional[str] = None,
-) -> QPushButton:
-    btn = QPushButton(text)
-    btn.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
-    btn.setMinimumHeight(32)
-    if min_width > 0:
-        btn.setMinimumWidth(min_width)
-    if object_name:
-        btn.setObjectName(object_name)
-    if tooltip:
-        btn.setToolTip(tooltip)
-    return btn
 
 _mutex_handle: Optional[int] = None
 
@@ -384,43 +118,9 @@ def release_single_instance_mutex() -> None:
     _mutex_handle = None
 
 
-def _show_message(
-    parent: Optional[QWidget],
-    text: str,
-    title: str = APP_NAME,
-    *,
-    level: str = "info",
-) -> None:
-    """Display a branded message box using FreeTG's custom icon everywhere."""
-    box = QMessageBox(parent)
-    box.setWindowTitle(title)
-    box.setWindowIcon(load_app_icon())
-    box.setIconPixmap(load_logo_pixmap(44))
-    box.setStyleSheet(_APP_STYLESHEET)
-    box.setText(text)
-    ok_btn = box.addButton("ОК", QMessageBox.ButtonRole.AcceptRole)
-    if ok_btn is not None:
-        ok_btn.setObjectName("primaryBtn")
-        ok_btn.setMinimumHeight(30)
-    box.exec()
-
-
 def show_native_info(text: str, title: str = APP_NAME, error: bool = False) -> None:
-    try:
-        app = QApplication.instance()
-        created = False
-        if app is None:
-            app = QApplication(sys.argv or [APP_NAME])
-            app.setWindowIcon(load_app_icon())
-            created = True
-        _show_message(None, text, title, level="error" if error else "info")
-        if created:
-            app.quit()
-        return
-    except Exception:
-        pass
     if sys.platform == "win32":
-        flags = 0x10 if error else 0x40  # MB_ICONERROR / MB_ICONINFORMATION
+        flags = 0x10 if error else 0x40
         try:
             ctypes.windll.user32.MessageBoxW(None, text, title, flags)
             return
@@ -429,65 +129,13 @@ def show_native_info(text: str, title: str = APP_NAME, error: bool = False) -> N
     log.info("[%s] %s", title, text)
 
 
-def _build_fallback_pixmap(size: int = 128) -> QPixmap:
-    """Fallback vector icon drawn with Qt if bundled image assets are absent."""
-    pm = QPixmap(size, size)
-    pm.fill(Qt.GlobalColor.transparent)
-    p = QPainter(pm)
-    p.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-    p.setBrush(QColor("#0F172A"))
-    p.setPen(QColor("#10B981"))
-    margin = max(2, int(size * 0.04))
-    radius = int(size * 0.22)
-    p.drawRoundedRect(margin, margin, size - 2 * margin, size - 2 * margin, radius, radius)
-
-    # Draw simplified green paper plane
-    plane = QPainterPath()
-    plane.moveTo(size * 0.20, size * 0.56)
-    plane.lineTo(size * 0.80, size * 0.24)
-    plane.lineTo(size * 0.56, size * 0.80)
-    plane.lineTo(size * 0.44, size * 0.58)
-    plane.closeSubpath()
-    p.setBrush(QColor("#00E676"))
-    p.setPen(Qt.PenStyle.NoPen)
-    p.drawPath(plane)
-    p.end()
-    return pm
-
-
-def load_logo_pixmap(size: int = 64) -> QPixmap:
-    for rel in ("assets/logo.png", "icon.ico"):
-        path = resource_path(rel)
-        if path.exists():
-            pm = QPixmap(str(path))
-            if not pm.isNull():
-                return pm.scaled(
-                    size,
-                    size,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-    return _build_fallback_pixmap(size)
-
-
-def load_app_icon() -> QIcon:
-    for rel in ("icon.ico", "assets/icon.ico", "assets/logo.png"):
-        path = resource_path(rel)
-        if path.exists():
-            icon = QIcon(str(path))
-            if not icon.isNull():
-                return icon
-    return QIcon(_build_fallback_pixmap(64))
-
-
 def _format_listen_error(host: str, port: int, exc: Exception) -> str:
     if isinstance(exc, OSError):
         errno = getattr(exc, "winerror", None) or getattr(exc, "errno", None)
         if errno in (10048, 98, 48):
             return (
                 f"Порт {host}:{port} уже занят другим приложением.\n\n"
-                "Остановите другой процесс на этом порту (или старый скрипт) и попробуйте другой порт в Настройках."
+                "Остановите другой процесс на этом порту и попробуйте другой порт в Настройках."
             )
         if errno in (10013, 13):
             return (
@@ -495,6 +143,206 @@ def _format_listen_error(host: str, port: int, exc: Exception) -> str:
                 "Выберите порт выше 1024 или запустите от имени администратора."
             )
     return f"Не удалось запустить прокси на {host}:{port}:\n{exc}"
+
+
+def _open_tg_link(
+    cfg: Dict[str, Any],
+    tray: Optional[Win32TrayIcon] = None,
+    root: Optional[tk.Misc] = None,
+) -> None:
+    url = tg_proxy_url(cfg)
+    log.info("Opening Telegram proxy URL: %s", url)
+    try:
+        if sys.platform == "win32":
+            os.startfile(url)
+            return
+        if webbrowser.open(url):
+            return
+    except Exception as exc:
+        log.warning("Failed to open tg:// link (%r), copying to clipboard", exc)
+
+    if root is not None:
+        try:
+            root.clipboard_clear()
+            root.clipboard_append(url)
+            root.update()
+        except Exception:
+            pass
+    msg = f"Ссылка скопирована в буфер обмена. Вставьте её в Telegram («Избранное») и нажмите:\n{url}"
+    if tray is not None:
+        tray.show_notification(APP_NAME, msg)
+    else:
+        show_native_info(msg, APP_NAME)
+
+
+def _apply_window_branding(win: tk.Wm, *, title: str) -> None:
+    win.title(title)
+    try:
+        ico = resource_path("icon.ico")
+        if sys.platform == "win32" and ico.exists():
+            win.iconbitmap(default=str(ico))
+    except Exception:
+        pass
+    if sys.platform == "win32":
+        try:
+            win.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(win.winfo_id()) or win.winfo_id()
+            apply_dark_titlebar(int(hwnd))
+        except Exception:
+            pass
+
+
+def _load_logo_photo(master: Optional[tk.Misc] = None) -> Optional[tk.PhotoImage]:
+    try:
+        logo = resource_path("assets/logo.png")
+        if logo.exists():
+            pm = tk.PhotoImage(master=master, file=str(logo))
+            w = pm.width()
+            if w >= 96:
+                factor = max(1, w // 48)
+                pm = pm.subsample(factor, factor)
+            return pm
+    except Exception:
+        pass
+    return None
+
+
+def _style_ttk(root: tk.Misc) -> None:
+    style = ttk.Style(root)
+    try:
+        style.theme_use("clam")
+    except Exception:
+        pass
+    style.configure(
+        "Dark.TCombobox",
+        fieldbackground=_INPUT_BG,
+        background=_BTN_BG,
+        foreground="#F8FAFC",
+        arrowcolor=_ACCENT_HOVER,
+        bordercolor=_INPUT_BORDER,
+        lightcolor=_INPUT_BORDER,
+        darkcolor=_INPUT_BORDER,
+        padding=4,
+    )
+    style.map(
+        "Dark.TCombobox",
+        fieldbackground=[("readonly", _INPUT_BG)],
+        foreground=[("readonly", "#F8FAFC")],
+        background=[("active", _BTN_HOVER)],
+    )
+    style.configure(
+        "Dark.Vertical.TScrollbar",
+        background=_BTN_BG,
+        troughcolor=_BG,
+        bordercolor=_BG,
+        arrowcolor=_MUTED,
+        gripcount=0,
+    )
+    root.option_add("*TCombobox*Listbox.background", _INPUT_BG)
+    root.option_add("*TCombobox*Listbox.foreground", "#F8FAFC")
+    root.option_add("*TCombobox*Listbox.selectBackground", "#059669")
+    root.option_add("*TCombobox*Listbox.selectForeground", "#FFFFFF")
+
+
+def _make_btn(
+    parent: tk.Misc,
+    text: str,
+    command: Callable[[], None],
+    *,
+    primary: bool = False,
+    danger: bool = False,
+    image: Optional[tk.PhotoImage] = None,
+) -> tk.Button:
+    if primary:
+        bg, fg, abg, afg, font = _ACCENT, _ACCENT_TEXT, _ACCENT_HOVER, _ACCENT_TEXT, ("Segoe UI", 9, "bold")
+    elif danger:
+        bg, fg, abg, afg, font = _DANGER_BG, _DANGER_FG, "#331822", _DANGER_FG, ("Segoe UI", 9)
+    else:
+        bg, fg, abg, afg, font = _BTN_BG, _TEXT, _BTN_HOVER, "#FFFFFF", ("Segoe UI", 9)
+    kw: Dict[str, Any] = {
+        "text": text,
+        "command": command,
+        "bg": bg,
+        "fg": fg,
+        "activebackground": abg,
+        "activeforeground": afg,
+        "disabledforeground": _DIM,
+        "relief": "flat",
+        "bd": 0,
+        "highlightthickness": 1,
+        "highlightbackground": _ACCENT if primary else ("#7F1D1D" if danger else "#2A3B58"),
+        "padx": 11,
+        "pady": 5,
+        "cursor": "hand2",
+        "font": font,
+    }
+    if image is not None:
+        kw["image"] = image
+        kw["compound"] = "left"
+    return tk.Button(parent, **kw)
+
+
+class _WrapFrame(tk.Frame):
+    """Responsive flow container that wraps child buttons smoothly when window narrows."""
+
+    def __init__(self, master: tk.Misc, *, bg: str = _CARD_BG, hgap: int = 8, vgap: int = 6) -> None:
+        super().__init__(master, bg=bg, bd=0, highlightthickness=0)
+        self._hgap = hgap
+        self._vgap = vgap
+        self._children: List[tk.Widget] = []
+        self.bind("<Configure>", self._relayout)
+
+    def add_widget(self, w: tk.Widget) -> tk.Widget:
+        self._children.append(w)
+        self.after_idle(self._relayout)
+        return w
+
+    def _relayout(self, _event=None) -> None:
+        width = max(120, self.winfo_width())
+        x = 0
+        y = 0
+        row_h = 0
+        for w in self._children:
+            if not getattr(w, "_wrap_visible", True):
+                w.place_forget()
+                continue
+            rw = max(w.winfo_reqwidth(), 24)
+            rh = max(w.winfo_reqheight(), 28)
+            if x > 0 and x + rw > width:
+                x = 0
+                y += row_h + self._vgap
+                row_h = 0
+            w.place(x=x, y=y, width=rw, height=rh)
+            x += rw + self._hgap
+            row_h = max(row_h, rh)
+        total_h = y + row_h if row_h > 0 else 1
+        if int(self.cget("height") or 0) != total_h:
+            self.configure(height=total_h)
+
+
+class _ScrollableFrame(tk.Frame):
+    """Vertical scrollable viewport adapted for dark cards without horizontal overflow."""
+
+    def __init__(self, master: tk.Misc, *, bg: str = _BG) -> None:
+        super().__init__(master, bg=bg)
+        self.canvas = tk.Canvas(self, bg=bg, bd=0, highlightthickness=0)
+        self.vbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview, style="Dark.Vertical.TScrollbar")
+        self.inner = tk.Frame(self.canvas, bg=bg)
+        self._win_id = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.canvas.configure(yscrollcommand=self.vbar.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.vbar.pack(side="right", fill="y")
+
+        self.inner.bind("<Configure>", lambda _e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>", self._on_canvas_resize)
+        self.canvas.bind("<Enter>", lambda _e: self.canvas.bind_all("<MouseWheel>", self._on_mousewheel))
+        self.canvas.bind("<Leave>", lambda _e: self.canvas.unbind_all("<MouseWheel>"))
+
+    def _on_canvas_resize(self, event) -> None:
+        self.canvas.itemconfigure(self._win_id, width=max(100, event.width - 4))
+
+    def _on_mousewheel(self, event) -> None:
+        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
 
 class ProxyController:
@@ -548,11 +396,16 @@ class ProxyController:
             self._last_error = None
 
         bypass_mode = str(cfg.get("bypass_mode", "auto")).lower()
-        if bypass_mode == "windivert":
+        desync_profile = str(cfg.get("desync_profile", "auto")).lower()
+        if bypass_mode in ("windivert", "windivert1"):
+            eng = "zapret1" if bypass_mode == "windivert1" else "zapret2"
+            prof = ZAPRET2_PROFILE_ORDER[0] if desync_profile == "auto" else desync_profile
             if cfg.get("builtin_desync", True) and not desync_manager.is_external_winws_running():
-                ok_w, err_w = desync_manager.start(str(cfg.get("worker_domain", "")))
+                ok_w, err_w = desync_manager.start(
+                    str(cfg.get("worker_domain", "")), profile=prof, engine=eng
+                )
                 if not ok_w and err_w:
-                    log.warning("Failed to start forced WinDivert bypass: %s", err_w)
+                    log.warning("Failed to start forced %s bypass: %s", eng, err_w)
         elif bypass_mode in ("port80", "tls_frag", "direct") or not cfg.get("builtin_desync", True):
             desync_manager.stop()
 
@@ -679,7 +532,7 @@ class ProxyController:
         cfg: Dict[str, Any],
         on_notice: Optional[Callable[[Dict[str, Any], str], None]] = None,
     ) -> None:
-        """Probe TLS + 22KB stream and auto-enable TLS frag / CF Port 80 / built-in winws if TSPU blocks."""
+        """Router-safe 4-stage probe: Direct 443 -> CF Port 80 -> TLS frag 443 -> zapret2 profiles."""
         if str(cfg.get("bypass_mode", "auto")).lower() != "auto":
             return
         if not cfg.get("auto_tune", True):
@@ -694,26 +547,20 @@ class ProxyController:
             if srv is None or loop is None:
                 return
 
-            updated = False
-            notes = []
+            notes: List[str] = []
 
-            if srv.carousel.frag_tls:
-                notes.append("включена фрагментация TLS")
-
-            # Check deep stream (>22KB) on DC2 and verify DC203 using live carousel settings
-            async def _probe_once(prefer_port80: bool = False) -> Tuple[bool, int, Optional[str]]:
+            async def _probe_once(*, use_frag: bool = False, prefer_port80: bool = False) -> Tuple[bool, int, Optional[str]]:
                 probe_pool = DcCarouselPool(
                     worker_domain=srv.config.worker_domain,
                     mode=srv.config.mode,
                     pool_size=1,
-                    frag_tls=srv.carousel.frag_tls,
+                    frag_tls=use_frag,
                     prefer_port80_cf=prefer_port80,
+                    allow_port80_fallback=False,
+                    auto_tls_frag=False,
                 )
                 try:
                     await probe_pool.initialize()
-                    if not prefer_port80 and probe_pool.frag_tls and not srv.carousel.frag_tls:
-                        srv.carousel.frag_tls = True
-                        notes.append("включена фрагментация TLS")
                     deep_ok, sent_b, deep_err = await probe_pool.probe_deep_stream(dc=2, target_bytes=22000)
                     if not deep_ok:
                         return False, sent_b, deep_err
@@ -727,66 +574,91 @@ class ProxyController:
                 finally:
                     await probe_pool.close()
 
+            def _apply_live_flags(*, frag: bool, port80: bool) -> None:
+                srv.carousel.frag_tls = frag
+                srv.carousel.prefer_port80_cf = port80
+                try:
+                    loop.call_soon_threadsafe(srv.carousel._endpoint_cooldown.clear)
+                    asyncio.run_coroutine_threadsafe(srv.carousel.flush_stream_idle(), loop)
+                except RuntimeError:
+                    pass
+
             probe_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(probe_loop)
             try:
-                deep_ok, sent_b, deep_err = probe_loop.run_until_complete(_probe_once(prefer_port80=False))
-                if not deep_ok:
-                    log.warning(
-                        "Deep 22KB check failed (%s at %dB); trying CF Port 80 (zero-zapret)",
-                        deep_err,
-                        sent_b,
-                    )
-                    p80_ok, p80_sent, p80_err = probe_loop.run_until_complete(
-                        _probe_once(prefer_port80=True)
-                    )
-                    if p80_ok:
-                        srv.carousel.prefer_port80_cf = True
-                        try:
-                            asyncio.run_coroutine_threadsafe(srv.carousel.flush_stream_idle(), loop)
-                        except RuntimeError:
-                            pass
-                        notes.append("включён режим CF Port 80 (работает без zapret)")
-                        updated = True
-                        log.info(
-                            "Auto-tune enabled CF Port 80 zero-zapret mode (%dB OK)",
-                            p80_sent,
-                        )
-                    else:
-                        log.warning(
-                            "CF Port 80 check failed (%s at %dB); trying built-in winws bypass",
-                            p80_err,
-                            p80_sent,
-                        )
-                        if cfg.get("builtin_desync", True) and not desync_manager.is_external_winws_running():
-                            ok_w, err_w = desync_manager.start(srv.config.worker_domain)
-                            if ok_w:
-                                re_ok, re_sent, re_err = probe_loop.run_until_complete(
-                                    _probe_once(prefer_port80=False)
-                                )
-                                if re_ok:
-                                    notes.append("активирован встроенный обход ТСПУ (WinDivert)")
-                                    updated = True
-                                    try:
-                                        loop.call_soon_threadsafe(srv.carousel._endpoint_cooldown.clear)
-                                    except RuntimeError:
-                                        pass
-                                else:
-                                    log.warning(
-                                        "Deep 22KB check still failed after built-in winws: %s",
-                                        re_err,
-                                    )
-                            elif err_w:
-                                notes.append(f"встроенный WinDivert не запущен: {err_w}")
-                                updated = True
+                # 1. Direct Port 443 (works out-of-the-box with router zapret1/zapret2 or open CF)
+                init_frag = bool(srv.carousel.frag_tls)
+                ok443, sent_b, err443 = probe_loop.run_until_complete(
+                    _probe_once(use_frag=init_frag, prefer_port80=False)
+                )
+                if ok443:
+                    log.info("Auto-tune check passed on Port 443: %dB + DC203 OK", sent_b)
+                    return
+
+                # 2. CF Port 80 (driverless, safe alongside external/router zapret)
+                log.warning("Port 443 check failed (%s at %dB); trying CF Port 80", err443, sent_b)
+                ok80, sent80, err80 = probe_loop.run_until_complete(
+                    _probe_once(use_frag=False, prefer_port80=True)
+                )
+                if ok80:
+                    _apply_live_flags(frag=False, port80=True)
+                    notes.append("включён режим CF Port 80 (без драйверов)")
+                    log.info("Auto-tune switched to CF Port 80 (%dB OK)", sent80)
                 else:
-                    log.info("Auto-tune check passed: %dB transferred on single DC2 socket without freeze", sent_b)
+                    # 3. TLS TCP-segment frag on Port 443 (no driver needed)
+                    log.warning("CF Port 80 failed (%s); trying TLS ClientHello frag on 443", err80)
+                    ok_frag, sent_frag, err_frag = probe_loop.run_until_complete(
+                        _probe_once(use_frag=True, prefer_port80=False)
+                    )
+                    if ok_frag:
+                        _apply_live_flags(frag=True, port80=False)
+                        notes.append("включена TLS-фрагментация (порт 443)")
+                        log.info("Auto-tune enabled TCP-segment TLS frag (%dB OK)", sent_frag)
+                    elif desync_manager.is_external_winws_running():
+                        notes.append(
+                            "обнаружен внешний zapret, но Cloudflare (443/80) недоступен; "
+                            "добавьте домены .co.uk / IP CF в ваш zapret или отключите его"
+                        )
+                    elif cfg.get("builtin_desync", True):
+                        # 4. Built-in zapret2 profiles (stops automatically if all profiles fail)
+                        pref_prof = str(cfg.get("desync_profile", "auto")).lower()
+                        profiles = (
+                            list(ZAPRET2_PROFILE_ORDER)
+                            if pref_prof == "auto"
+                            else [pref_prof]
+                        )
+                        winws2_worked = False
+                        last_w_err: Optional[str] = None
+                        for prof in profiles:
+                            ok_w, err_w = desync_manager.start(
+                                srv.config.worker_domain, profile=prof, engine="zapret2"
+                            )
+                            if not ok_w:
+                                last_w_err = err_w
+                                break
+                            re_ok, re_sent, re_err = probe_loop.run_until_complete(
+                                _probe_once(use_frag=False, prefer_port80=False)
+                            )
+                            if re_ok:
+                                winws2_worked = True
+                                label = ZAPRET2_PROFILE_LABELS.get(prof, prof)
+                                notes.append(f"активирован zapret2 ({label})")
+                                _apply_live_flags(frag=False, port80=False)
+                                log.info("Auto-tune activated zapret2 profile %s (%dB OK)", prof, re_sent)
+                                break
+                            log.warning("zapret2 profile %s did not pass: %s", prof, re_err)
+                        if not winws2_worked:
+                            desync_manager.stop()
+                            if last_w_err:
+                                notes.append(f"zapret2 не запущен: {last_w_err}")
+                            else:
+                                notes.append("все профили zapret2 не прошли проверку; обход остановлен")
             except Exception as exc:
                 log.debug("Auto-tune check skipped: %r", exc)
             finally:
                 probe_loop.close()
 
-            if on_notice and (updated or notes):
+            if on_notice and notes:
                 on_notice(dict(cfg), "Автоподбор обхода: " + "; ".join(notes))
 
         self._autotune_thread = threading.Thread(target=_tune, daemon=True, name="freetg-autotune")
@@ -800,7 +672,7 @@ class ProxyController:
         cfg: Dict[str, Any],
         on_notice: Optional[Callable[[Dict[str, Any], str], None]] = None,
     ) -> None:
-        """Monitor external zapret/winws.exe so built-in WinDivert never runs alongside it."""
+        """Monitor external winws/winws2 so built-in zapret2 yields cleanly without WinDivert conflicts."""
         self.stop_zapret_watcher()
         self._watch_cfg = dict(cfg)
         self._watch_stop.clear()
@@ -815,12 +687,12 @@ class ProxyController:
                     if on_notice:
                         on_notice(
                             dict(self._watch_cfg),
-                            "Обнаружен внешний zapret — встроенный WinDivert автоматически отключён",
+                            "Обнаружен внешний zapret/zapret2 — встроенный модуль остановлен без сброса драйвера",
                         )
                     continue
                 now_external = desync_manager.is_external_winws_running()
                 if was_external and not now_external:
-                    log.info("External zapret/winws.exe stopped; triggering auto-tune check")
+                    log.info("External zapret stopped; triggering auto-tune check")
                     if self._watch_cfg.get("auto_tune", True):
                         self.run_auto_tune_async(self._watch_cfg, on_notice=on_notice)
                 was_external = now_external
@@ -843,11 +715,13 @@ class ProxyController:
             return {"running": False, "err": self._last_error}
         st = srv.carousel.stats
         if desync_manager.is_external_winws_running():
-            desync_label = "zapret"
+            desync_label = "внешний zapret"
         elif desync_manager.is_running():
-            desync_label = "WinDivert"
+            eng = desync_manager.active_engine or "zapret2"
+            prof = desync_manager.active_profile or ""
+            desync_label = f"{eng} ({prof})" if prof else eng
         elif getattr(srv.carousel, "prefer_port80_cf", False):
-            desync_label = "CF-Port80 (без zapret)"
+            desync_label = "CF Port 80"
         elif srv.carousel.frag_tls:
             desync_label = "TLS-фраг"
         else:
@@ -899,12 +773,14 @@ async def test_worker_connectivity_async(
     frag_tls: bool,
     *,
     bypass_mode: str = "auto",
+    desync_profile: str = "auto",
     builtin_desync: bool = True,
     auto_tune: bool = True,
     controller: Optional[ProxyController] = None,
 ) -> Tuple[str, bool]:
     domain = sanitize_worker_domain(worker_domain)
     bmode = (bypass_mode or "auto").lower()
+    dprof = (desync_profile or "auto").lower()
     target_label = domain if domain else "публичный пул CF (20 доменов)"
 
     async def _run_suite(
@@ -916,7 +792,8 @@ async def test_worker_connectivity_async(
             pool_size=1,
             frag_tls=use_frag,
             prefer_port80_cf=prefer_port80,
-            allow_port80_fallback=(bmode in ("auto", "port80")),
+            allow_port80_fallback=False,
+            auto_tls_frag=False,
         )
         try:
             await pool.initialize()
@@ -962,7 +839,7 @@ async def test_worker_connectivity_async(
             deep_ok, ok_dcs, fail_lines, mode_label, effective_frag, _, deep_err = await _run_suite(
                 False, prefer_port80=True
             )
-            winws_note = ", CF Port 80 (без zapret)"
+            winws_note = ", CF Port 80 (без драйвера)"
         elif bmode == "tls_frag":
             deep_ok, ok_dcs, fail_lines, mode_label, effective_frag, _, deep_err = await _run_suite(
                 True, prefer_port80=False
@@ -973,53 +850,69 @@ async def test_worker_connectivity_async(
             )
             if desync_manager.is_external_winws_running():
                 winws_note = ", внешний zapret"
-        elif bmode == "windivert":
+        elif bmode in ("windivert", "windivert1"):
+            eng = "zapret1" if bmode == "windivert1" else "zapret2"
             if builtin_desync and not desync_manager.is_external_winws_running():
-                ok_w, err_w = desync_manager.start(domain)
-                if ok_w:
-                    winws_note = ", встроенный WinDivert"
-                elif err_w:
-                    return f"✗ {target_label}: WinDivert не запущен — {err_w}", False
-            elif desync_manager.is_external_winws_running():
-                winws_note = ", внешний zapret"
+                profiles = (
+                    list(ZAPRET2_PROFILE_ORDER)
+                    if (eng == "zapret2" and dprof == "auto")
+                    else [dprof]
+                )
+                deep_ok = False
+                ok_dcs, fail_lines, mode_label, effective_frag, deep_err = [], [], mode.upper(), False, None
+                for prof in profiles:
+                    ok_w, err_w = desync_manager.start(domain, profile=prof, engine=eng)
+                    if not ok_w:
+                        return f"✗ {target_label}: {eng} не запущен — {err_w}", False
+                    deep_ok, ok_dcs, fail_lines, mode_label, effective_frag, _, deep_err = await _run_suite(
+                        False, prefer_port80=False
+                    )
+                    winws_note = f", {eng} ({prof})" if eng == "zapret2" else ", zapret1 (winws.exe)"
+                    if deep_ok:
+                        break
+                if not deep_ok:
+                    desync_manager.stop()
+            else:
+                if desync_manager.is_external_winws_running():
+                    winws_note = ", внешний zapret (встроенный отключён)"
+                deep_ok, ok_dcs, fail_lines, mode_label, effective_frag, _, deep_err = await _run_suite(
+                    False, prefer_port80=False
+                )
+        else:
+            # Cascade: 443 -> Port 80 -> TLS frag -> zapret2 profiles
             deep_ok, ok_dcs, fail_lines, mode_label, effective_frag, _, deep_err = await _run_suite(
                 False, prefer_port80=False
-            )
-        else:
-            deep_ok, ok_dcs, fail_lines, mode_label, effective_frag, _, deep_err = await _run_suite(
-                frag_tls, prefer_port80=False
             )
             if not deep_ok:
                 p80_res = await _run_suite(False, prefer_port80=True)
                 if p80_res[0]:
                     deep_ok, ok_dcs, fail_lines, mode_label, effective_frag, _, deep_err = p80_res
-                    winws_note = ", CF Port 80 (без zapret)"
-                    if controller is not None:
-                        with controller._lock:
-                            live_srv = controller._server
-                            live_loop = controller._loop
-                        if live_srv is not None:
-                            live_srv.carousel.prefer_port80_cf = True
-                            if live_loop is not None:
-                                try:
-                                    asyncio.run_coroutine_threadsafe(
-                                        live_srv.carousel.flush_stream_idle(), live_loop
-                                    )
-                                except RuntimeError:
-                                    pass
-                elif builtin_desync and auto_tune and not desync_manager.is_external_winws_running():
-                    ok_w, err_w = desync_manager.start(domain)
-                    if ok_w:
-                        winws_note = ", встроенный WinDivert"
-                        deep_ok, ok_dcs, fail_lines, mode_label, effective_frag, _, deep_err = await _run_suite(
-                            effective_frag, prefer_port80=False
-                        )
-                    elif err_w:
-                        fail_lines.append(f"WinDivert: {err_w}")
+                    winws_note = ", CF Port 80"
+                else:
+                    frag_res = await _run_suite(True, prefer_port80=False)
+                    if frag_res[0]:
+                        deep_ok, ok_dcs, fail_lines, mode_label, effective_frag, _, deep_err = frag_res
+                    elif desync_manager.is_external_winws_running():
+                        winws_note = ", внешний zapret активен (Cloudflare 443/80 не отвечает)"
+                    elif builtin_desync and auto_tune:
+                        profiles = list(ZAPRET2_PROFILE_ORDER) if dprof == "auto" else [dprof]
+                        for prof in profiles:
+                            ok_w, err_w = desync_manager.start(domain, profile=prof, engine="zapret2")
+                            if not ok_w:
+                                if err_w:
+                                    fail_lines.append(f"zapret2: {err_w}")
+                                break
+                            z2_res = await _run_suite(False, prefer_port80=False)
+                            if z2_res[0]:
+                                deep_ok, ok_dcs, fail_lines, mode_label, effective_frag, _, deep_err = z2_res
+                                winws_note = f", zapret2 ({prof})"
+                                break
+                        if not deep_ok:
+                            desync_manager.stop()
             elif desync_manager.is_external_winws_running():
                 winws_note = ", внешний zapret"
             elif desync_manager.is_running():
-                winws_note = ", встроенный WinDivert"
+                winws_note = f", {desync_manager.active_engine or 'zapret2'}"
 
         frag_note = ", TLS-фраг вкл" if effective_frag else ""
         if deep_ok and len(ok_dcs) == 3:
@@ -1040,132 +933,74 @@ async def test_worker_connectivity_async(
         return f"✗ Ошибка проверки {target_label}: {exc}", frag_tls
 
 
-class _ConnectivityWorker(QThread):
-    finished_result = pyqtSignal(str, bool)
+class FirstRunDialog:
+    """Minimalist dark tkinter assistant with Automatic and Manual MTProto instructions."""
 
-    def __init__(
-        self,
-        domain: str,
-        mode: str,
-        frag_tls: bool,
-        builtin_desync: bool,
-        auto_tune: bool,
-        bypass_mode: str = "auto",
-        controller: Optional[ProxyController] = None,
-        parent: Optional[QObject] = None,
-    ) -> None:
-        super().__init__(parent)
-        self._domain = domain
-        self._mode = mode
-        self._frag_tls = frag_tls
-        self._builtin_desync = builtin_desync
-        self._auto_tune = auto_tune
-        self._bypass_mode = bypass_mode
-        self._controller = controller
-
-    def run(self) -> None:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            msg, eff_frag = loop.run_until_complete(
-                test_worker_connectivity_async(
-                    self._domain,
-                    self._mode,
-                    self._frag_tls,
-                    bypass_mode=self._bypass_mode,
-                    builtin_desync=self._builtin_desync,
-                    auto_tune=self._auto_tune,
-                    controller=self._controller,
-                )
-            )
-        except Exception as exc:
-            msg, eff_frag = f"✗ Ошибка: {exc}", self._frag_tls
-        finally:
-            loop.close()
-        self.finished_result.emit(msg, eff_frag)
-
-
-def _open_tg_link(
-    cfg: Dict[str, Any],
-    parent_tray: Optional[QSystemTrayIcon] = None,
-    icon: Optional[QIcon] = None,
-) -> None:
-    url = tg_proxy_url(cfg)
-    log.info("Opening Telegram proxy URL: %s", url)
-    try:
-        if sys.platform == "win32":
-            os.startfile(url)
-            return
-        if webbrowser.open(url):
-            return
-    except Exception as exc:
-        log.warning("Failed to open tg:// link directly (%r), copying to clipboard", exc)
-
-    cb = QApplication.clipboard()
-    if cb is not None:
-        cb.setText(url)
-    msg = (
-        f"Ссылка скопирована в буфер обмена. Вставьте её в Telegram («Избранное») и нажмите:\n{url}"
-    )
-    if parent_tray is not None:
-        parent_tray.showMessage(APP_NAME, msg, icon or load_app_icon(), 5000)
-    else:
-        _show_message(None, msg, APP_NAME)
-
-
-class FirstRunDialog(QDialog):
-    """Minimalist, responsive setup assistant with Automatic and Manual MTProto instructions."""
-
-    def __init__(self, cfg: Dict[str, Any], parent: Optional[QWidget] = None) -> None:
-        super().__init__(parent)
+    def __init__(self, master: tk.Misc, cfg: Dict[str, Any]) -> None:
         self._cfg = cfg
-        self.open_on_finish = False
+        self.accepted = False
         self.dont_show_again = True
-        self.setWindowTitle(f"{APP_NAME} v{__version__} — Подключение Telegram")
-        self.setWindowIcon(load_app_icon())
-        self.setMinimumSize(380, 460)
-        self.resize(500, 540)
-        self.setSizeGripEnabled(True)
-        self.setStyleSheet(_APP_STYLESHEET)
 
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(16, 14, 16, 14)
-        outer.setSpacing(12)
+        self.win = tk.Toplevel(master)
+        self.win.configure(bg=_BG)
+        self.win.minsize(380, 460)
+        self.win.geometry("500x540")
+        _apply_window_branding(self.win, title=f"{APP_NAME} v{__version__} — Подключение Telegram")
+        self._logo = _load_logo_photo(self.win)
 
-        # Branded header
-        header = QHBoxLayout()
-        header.setSpacing(12)
-        logo_lbl = QLabel()
-        logo_lbl.setPixmap(load_logo_pixmap(48))
-        logo_lbl.setFixedSize(48, 48)
-        header.addWidget(logo_lbl)
+        outer = tk.Frame(self.win, bg=_BG)
+        outer.pack(fill="both", expand=True, padx=16, pady=14)
 
-        title_col = QVBoxLayout()
-        title_col.setSpacing(2)
-        title_lbl = QLabel(
-            f"{APP_NAME} <span style='color:#94A3B8;font-size:12px;'>v{__version__}</span>"
-        )
-        title_lbl.setStyleSheet("font-size: 18px; font-weight: 700; color: #F8FAFC;")
-        worker_lbl_txt = (
-            self._cfg.get("worker_domain") or "Публичный пул Cloudflare (20+ доменов)"
-        )
-        sub_lbl = QLabel(f"Прокси запущен • {worker_lbl_txt}")
-        sub_lbl.setWordWrap(True)
-        sub_lbl.setStyleSheet("font-size: 12px; color: #34D399; font-weight: 600;")
-        title_col.addWidget(title_lbl)
-        title_col.addWidget(sub_lbl)
-        header.addLayout(title_col, 1)
-        outer.addLayout(header)
+        # Header
+        hdr = tk.Frame(outer, bg=_BG)
+        hdr.pack(fill="x", pady=(0, 10))
+        if self._logo is not None:
+            tk.Label(hdr, image=self._logo, bg=_BG).pack(side="left", padx=(0, 12))
+        title_col = tk.Frame(hdr, bg=_BG)
+        title_col.pack(side="left", fill="x", expand=True)
+        tk.Label(
+            title_col,
+            text=f"{APP_NAME} v{__version__}",
+            bg=_BG, fg="#F8FAFC", font=("Segoe UI", 14, "bold"), anchor="w",
+        ).pack(fill="x")
+        worker_txt = self._cfg.get("worker_domain") or "Публичный пул Cloudflare (20+ доменов)"
+        tk.Label(
+            title_col,
+            text=f"Прокси запущен • {worker_txt}",
+            bg=_BG, fg=_ACCENT_HOVER, font=("Segoe UI", 9, "bold"), anchor="w", wraplength=380, justify="left",
+        ).pack(fill="x")
 
-        # Scrollable main body
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        body_widget = QWidget()
-        body_layout = QVBoxLayout(body_widget)
-        body_layout.setContentsMargins(0, 0, 0, 0)
-        body_layout.setSpacing(10)
+        # Tabs switcher
+        tab_bar = tk.Frame(outer, bg=_BG)
+        tab_bar.pack(fill="x")
+        card = tk.Frame(outer, bg=_CARD_BG, highlightbackground=_CARD_BORDER, highlightthickness=1)
+        card.pack(fill="both", expand=True)
+
+        auto_page = tk.Frame(card, bg=_CARD_BG)
+        manual_page = tk.Frame(card, bg=_CARD_BG)
+
+        self._tab_btns: List[tk.Button] = []
+
+        def _select_tab(idx: int) -> None:
+            for i, btn in enumerate(self._tab_btns):
+                if i == idx:
+                    btn.configure(bg=_ACCENT, fg=_ACCENT_TEXT)
+                else:
+                    btn.configure(bg=_INPUT_BG, fg=_MUTED)
+            if idx == 0:
+                manual_page.pack_forget()
+                auto_page.pack(fill="both", expand=True, padx=12, pady=12)
+            else:
+                auto_page.pack_forget()
+                manual_page.pack(fill="both", expand=True, padx=12, pady=12)
+
+        for i, lbl in enumerate(("Автоматически", "Вручную (пошагово)")):
+            b = tk.Button(
+                tab_bar, text=lbl, command=lambda idx=i: _select_tab(idx),
+                relief="flat", bd=0, padx=14, pady=6, cursor="hand2", font=("Segoe UI", 9, "bold"),
+            )
+            b.pack(side="left", padx=(0, 4))
+            self._tab_btns.append(b)
 
         link_host = get_link_host(str(cfg.get("host", "127.0.0.1")))
         port = str(cfg.get("port", 1080))
@@ -1176,401 +1011,376 @@ class FirstRunDialog(QDialog):
         prefixed_secret = f"dd{clean_secret}"
         url = tg_proxy_url(cfg)
 
-        tabs = QTabWidget()
+        # Auto tab
+        tk.Label(
+            auto_page,
+            text=(
+                "Быстрое подключение в 1 клик:\n"
+                "1. Нажмите зелёную кнопку ниже — откроется Telegram Desktop.\n"
+                "2. В окне Telegram нажмите «Включить» (Enable proxy)."
+            ),
+            bg=_CARD_BG, fg="#CBD5E1", justify="left", anchor="w", wraplength=430, font=("Segoe UI", 10),
+        ).pack(fill="x", pady=(0, 12))
 
-        # Tab 1: Automatic one-click setup
-        auto_tab = QWidget()
-        auto_layout = QVBoxLayout(auto_tab)
-        auto_layout.setContentsMargins(6, 6, 6, 6)
-        auto_layout.setSpacing(12)
+        _make_btn(
+            auto_page, "  Открыть в Telegram", lambda: _open_tg_link(self._cfg, root=self.win), primary=True
+        ).pack(fill="x", ipady=4, pady=(0, 14))
 
-        auto_intro = QLabel(
-            "<b>Быстрое подключение в 1 клик</b><br>"
-            "1. Нажмите зелёную кнопку ниже — откроется Telegram Desktop.<br>"
-            "2. В окне Telegram нажмите <b>«Включить» (Enable proxy)</b>."
+        tk.Label(
+            auto_page,
+            text="Если Telegram не открылся автоматически — скопируйте ссылку в «Избранное»:",
+            bg=_CARD_BG, fg=_MUTED, justify="left", anchor="w", wraplength=430, font=("Segoe UI", 9),
+        ).pack(fill="x", pady=(0, 4))
+
+        link_row = tk.Frame(auto_page, bg=_CARD_BG)
+        link_row.pack(fill="x", pady=(0, 12))
+        e_url = tk.Entry(
+            link_row, bg=_INPUT_BG, fg="#F8FAFC", readonlybackground=_INPUT_BG,
+            relief="flat", highlightthickness=1, highlightbackground=_INPUT_BORDER, font=("Segoe UI", 9),
         )
-        auto_intro.setWordWrap(True)
-        auto_intro.setStyleSheet("color: #CBD5E1; line-height: 1.4;")
-        auto_layout.addWidget(auto_intro)
+        e_url.insert(0, url)
+        e_url.configure(state="readonly")
+        e_url.pack(side="left", fill="x", expand=True, ipady=5, padx=(0, 6))
+        copy_u_btn = _make_btn(link_row, "Копировать", lambda: self._copy_text(url, copy_u_btn))
+        copy_u_btn.pack(side="right")
 
-        open_btn = _make_btn("Открыть в Telegram", object_name="primaryBtn")
-        open_btn.setMinimumHeight(38)
-        open_btn.setIcon(load_app_icon())
-        open_btn.clicked.connect(lambda: _open_tg_link(self._cfg))
-        auto_layout.addWidget(open_btn)
+        tk.Label(
+            auto_page,
+            text="После закрытия окна FreeTG остаётся в системном трее рядом с часами.",
+            bg=_CARD_BG, fg=_DIM, anchor="w", wraplength=430, font=("Segoe UI", 8),
+        ).pack(fill="x", pady=(8, 0))
 
-        fallback_lbl = QLabel(
-            "<b>Если Telegram не открылся автоматически:</b><br>"
-            "Скопируйте ссылку ниже, вставьте её в чат <b>«Избранное»</b> и нажмите на неё:"
-        )
-        fallback_lbl.setWordWrap(True)
-        fallback_lbl.setStyleSheet("font-size: 12px; color: #94A3B8;")
-        auto_layout.addWidget(fallback_lbl)
-
-        link_box = QHBoxLayout()
-        link_box.setSpacing(6)
-        link_edit = QLineEdit(url)
-        link_edit.setReadOnly(True)
-        link_edit.setMinimumWidth(100)
-        copy_url_btn = _make_btn("Копировать")
-        copy_url_btn.clicked.connect(lambda: self._copy_text(url, copy_url_btn))
-        link_box.addWidget(link_edit, 1)
-        link_box.addWidget(copy_url_btn)
-        auto_layout.addLayout(link_box)
-
-        tray_hint = QLabel(
-            "После закрытия окна FreeTG остаётся в системном трее рядом с часами."
-        )
-        tray_hint.setWordWrap(True)
-        tray_hint.setStyleSheet("font-size: 11px; color: #64748B;")
-        auto_layout.addWidget(tray_hint)
-        auto_layout.addStretch(1)
-        tabs.addTab(auto_tab, "Автоматически")
-
-        # Tab 2: Manual step-by-step setup
-        manual_tab = QWidget()
-        manual_layout = QVBoxLayout(manual_tab)
-        manual_layout.setContentsMargins(6, 6, 6, 6)
-        manual_layout.setSpacing(10)
-
-        steps_lbl = QLabel(
-            "<b>Пошаговое добавление в Telegram Desktop:</b><br>"
-            "1. Откройте Telegram → <b>Настройки → Продвинутые → Тип соединения</b><br>"
-            "2. Нажмите <b>Использовать собственный прокси → Добавить прокси</b><br>"
-            "3. Выберите тип <b>MTProto</b> и скопируйте три поля ниже:<br>"
-            "4. Нажмите <b>Сохранить</b> и убедитесь, что галочка прокси включена."
-        )
-        steps_lbl.setWordWrap(True)
-        steps_lbl.setStyleSheet("color: #CBD5E1; line-height: 1.4;")
-        manual_layout.addWidget(steps_lbl)
+        # Manual tab
+        tk.Label(
+            manual_page,
+            text=(
+                "Пошаговое добавление в Telegram Desktop:\n"
+                "1. Настройки → Продвинутые → Тип соединения\n"
+                "2. Использовать собственный прокси → Добавить прокси → MTProto\n"
+                "3. Вставьте три поля ниже и нажмите «Сохранить»:"
+            ),
+            bg=_CARD_BG, fg="#CBD5E1", justify="left", anchor="w", wraplength=430, font=("Segoe UI", 9),
+        ).pack(fill="x", pady=(0, 10))
 
         for field_title, value in (
             ("Сервер:", link_host),
             ("Порт:", port),
             ("Ключ (dd...):", prefixed_secret),
         ):
-            row_col = QVBoxLayout()
-            row_col.setSpacing(3)
-            lbl = QLabel(field_title)
-            lbl.setStyleSheet("font-size: 11px; color: #94A3B8; font-weight: 600;")
-            row_h = QHBoxLayout()
-            row_h.setSpacing(6)
-            edit = QLineEdit(value)
-            edit.setReadOnly(True)
-            edit.setMinimumWidth(90)
-            c_btn = _make_btn("Копировать")
-            c_btn.clicked.connect(lambda _chk=False, v=value, b=c_btn: self._copy_text(v, b))
-            row_h.addWidget(edit, 1)
-            row_h.addWidget(c_btn)
-            row_col.addWidget(lbl)
-            row_col.addLayout(row_h)
-            manual_layout.addLayout(row_col)
+            tk.Label(manual_page, text=field_title, bg=_CARD_BG, fg=_MUTED, font=("Segoe UI", 8, "bold"), anchor="w").pack(fill="x")
+            row = tk.Frame(manual_page, bg=_CARD_BG)
+            row.pack(fill="x", pady=(2, 8))
+            ent = tk.Entry(
+                row, bg=_INPUT_BG, fg="#F8FAFC", readonlybackground=_INPUT_BG,
+                relief="flat", highlightthickness=1, highlightbackground=_INPUT_BORDER, font=("Segoe UI", 9),
+            )
+            ent.insert(0, value)
+            ent.configure(state="readonly")
+            ent.pack(side="left", fill="x", expand=True, ipady=5, padx=(0, 6))
+            cb_btn = _make_btn(row, "Копировать", lambda v=value: None)
+            cb_btn.configure(command=lambda v=value, b=cb_btn: self._copy_text(v, b))
+            cb_btn.pack(side="right")
 
-        manual_layout.addStretch(1)
-        tabs.addTab(manual_tab, "Вручную (пошагово)")
+        _select_tab(0)
 
-        body_layout.addWidget(tabs)
-        scroll.setWidget(body_widget)
-        outer.addWidget(scroll, 1)
+        # Footer
+        footer = _WrapFrame(outer, bg=_BG)
+        footer.pack(fill="x", pady=(10, 0))
+        self._dont_show_var = tk.BooleanVar(value=True)
+        chk = tk.Checkbutton(
+            footer, text="Больше не показывать при запуске", variable=self._dont_show_var,
+            bg=_BG, fg=_TEXT, selectcolor=_INPUT_BG, activebackground=_BG, activeforeground=_TEXT,
+            font=("Segoe UI", 9),
+        )
+        footer.add_widget(chk)
+        footer.add_widget(_make_btn(footer, "Готово", self._on_finish, primary=True))
+        self.win.protocol("WM_DELETE_WINDOW", self._on_finish)
 
-        # Responsive footer
-        footer = _FlowLayout(spacing=8)
-        self.dont_show_cb = QCheckBox("Больше не показывать при запуске")
-        self.dont_show_cb.setChecked(True)
-        self.open_now_cb = self.dont_show_cb  # kept for compatibility
-        footer.addWidget(self.dont_show_cb)
-
-        done_btn = _make_btn("Готово", min_width=100)
-        done_btn.clicked.connect(self._on_finish)
-        footer.addWidget(done_btn)
-        outer.addLayout(footer)
-
-    @staticmethod
-    def _copy_text(text: str, btn: QPushButton) -> None:
-        cb = QApplication.clipboard()
-        if cb is not None:
-            cb.setText(text)
-            btn.setText("Скопировано ✓")
+    def _copy_text(self, text: str, btn: tk.Button) -> None:
+        self.win.clipboard_clear()
+        self.win.clipboard_append(text)
+        self.win.update()
+        btn.configure(text="Скопировано ✓")
 
     def _on_finish(self) -> None:
-        self.dont_show_again = self.dont_show_cb.isChecked()
-        self.accept()
+        self.dont_show_again = bool(self._dont_show_var.get())
+        self.accepted = True
+        self.win.destroy()
 
 
-class SettingsDialog(QDialog):
-    """Minimalist, responsive GUI dialog for FreeTG proxy settings."""
+class SettingsDialog:
+    """Minimalist dark responsive Settings dialog using pure tkinter."""
+
+    _BYPASS_ITEMS: List[Tuple[str, str]] = [
+        ("auto", "Автоподбор (443 → Port 80 → TLS → zapret2)"),
+        ("port80", "CF Port 80 (без TLS и без драйверов)"),
+        ("windivert", "Встроенный zapret2 (winws2 + Lua)"),
+        ("tls_frag", "Фрагментация TLS ClientHello (порт 443)"),
+        ("direct", "Прямой / Роутер или внешний zapret (443)"),
+    ]
+    _PROFILE_ITEMS: List[Tuple[str, str]] = [
+        ("auto", "Авто (перебор стратегий)"),
+        ("z2_md5_disorder", "Профиль 1: md5 + multidisorder"),
+        ("z2_autottl_fakedsplit", "Профиль 2: autottl + fakedsplit"),
+        ("z2_disorder_only", "Профиль 3: только multidisorder (роутер/NAT)"),
+    ]
+    _MODE_ITEMS: List[Tuple[str, str]] = [
+        ("auto", "Авто (V1 / V2)"),
+        ("v1", "V1 — WebSocket стриминг"),
+        ("v2", "V2 — Карусельный синк"),
+    ]
 
     def __init__(
         self,
+        master: tk.Misc,
         cfg: Dict[str, Any],
         controller: ProxyController,
         on_applied: Callable[[Dict[str, Any], bool], None],
-        parent: Optional[QWidget] = None,
+        *,
         on_toggle_server: Optional[Callable[[], None]] = None,
         on_full_exit: Optional[Callable[[], None]] = None,
         on_open_guide: Optional[Callable[[], None]] = None,
     ) -> None:
-        super().__init__(parent)
         self._cfg = deepcopy(cfg)
         self._controller = controller
         self._on_applied = on_applied
         self._on_toggle_server = on_toggle_server
         self._on_full_exit = on_full_exit
         self._on_open_guide = on_open_guide
-        self._test_worker: Optional[_ConnectivityWorker] = None
+        self._testing = False
+        self._adv_open = False
 
-        self.setWindowTitle(f"{APP_NAME} — Настройки")
-        self.setWindowIcon(load_app_icon())
-        self.setMinimumSize(380, 440)
-        self.resize(510, 560)
-        self.setSizeGripEnabled(True)
-        self.setStyleSheet(_APP_STYLESHEET)
+        self._bypass_items = list(self._BYPASS_ITEMS)
+        if has_bundled_engine("zapret1"):
+            self._bypass_items.insert(
+                3, ("windivert1", "Встроенный zapret1 (winws.exe — для теста A/B)")
+            )
 
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(16, 14, 16, 14)
-        outer.setSpacing(10)
+        self.win = tk.Toplevel(master)
+        self.win.configure(bg=_BG)
+        self.win.minsize(380, 440)
+        self.win.geometry("510x580")
+        _apply_window_branding(self.win, title=f"{APP_NAME} — Настройки")
+        self._logo = _load_logo_photo(self.win)
 
-        # Compact Header + Live Status
-        hdr = QHBoxLayout()
-        hdr.setSpacing(10)
-        logo = QLabel()
-        logo.setPixmap(load_logo_pixmap(42))
-        logo.setFixedSize(42, 42)
-        hdr.addWidget(logo)
+        outer = tk.Frame(self.win, bg=_BG)
+        outer.pack(fill="both", expand=True, padx=16, pady=12)
 
-        hdr_text = QVBoxLayout()
-        hdr_text.setSpacing(1)
-        name_lbl = QLabel(
-            f"{APP_NAME}  <span style='color:#94A3B8;font-size:12px;'>v{__version__}</span>"
+        # Header + Status
+        hdr = tk.Frame(outer, bg=_BG)
+        hdr.pack(fill="x", pady=(0, 8))
+        if self._logo is not None:
+            tk.Label(hdr, image=self._logo, bg=_BG).pack(side="left", padx=(0, 10))
+        hdr_col = tk.Frame(hdr, bg=_BG)
+        hdr_col.pack(side="left", fill="x", expand=True)
+        tk.Label(
+            hdr_col, text=f"{APP_NAME} v{__version__}", bg=_BG, fg="#F8FAFC",
+            font=("Segoe UI", 13, "bold"), anchor="w",
+        ).pack(fill="x")
+        self._status_lbl = tk.Label(
+            hdr_col, text="", bg=_BG, fg=_ACCENT_HOVER, font=("Segoe UI", 9), anchor="w",
+            wraplength=390, justify="left",
         )
-        name_lbl.setStyleSheet("font-size: 17px; font-weight: 700; color: #F8FAFC;")
-        self._status_lbl = QLabel()
-        self._status_lbl.setWordWrap(True)
-        self._status_lbl.setStyleSheet("font-size: 12px; color: #34D399;")
-        hdr_text.addWidget(name_lbl)
-        hdr_text.addWidget(self._status_lbl)
-        hdr.addLayout(hdr_text, 1)
-        outer.addLayout(hdr)
+        self._status_lbl.pack(fill="x")
 
-        # Scrollable cards area
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        content = QWidget()
-        body = QVBoxLayout(content)
-        body.setContentsMargins(0, 0, 2, 0)
-        body.setSpacing(10)
+        # Scroll body
+        scroll = _ScrollableFrame(outer, bg=_BG)
+        scroll.pack(fill="both", expand=True)
+        body = scroll.inner
 
-        # Card 1: MTProto Listen settings
-        mt_group = QGroupBox("Подключение MTProto")
-        mt_layout = QVBoxLayout(mt_group)
-        mt_layout.setSpacing(8)
+        # Card 1: MTProto
+        c1 = self._make_card(body, "Подключение MTProto")
+        self._lbl(c1, "Локальный адрес и порт:")
+        addr_row = tk.Frame(c1, bg=_CARD_BG)
+        addr_row.pack(fill="x", pady=(2, 8))
+        self.host_var = tk.StringVar(value=str(self._cfg.get("host", "127.0.0.1")))
+        self.port_var = tk.StringVar(value=str(self._cfg.get("port", 1080)))
+        self._entry(addr_row, self.host_var).pack(side="left", fill="x", expand=True, ipady=4, padx=(0, 6))
+        tk.Spinbox(
+            addr_row, from_=1, to=65535, textvariable=self.port_var, width=8,
+            bg=_INPUT_BG, fg="#F8FAFC", buttonbackground=_BTN_BG, relief="flat",
+            highlightthickness=1, highlightbackground=_INPUT_BORDER, font=("Segoe UI", 9),
+        ).pack(side="right", ipady=4)
 
-        addr_lbl = QLabel("Локальный адрес и порт:")
-        addr_lbl.setStyleSheet("font-size: 11px; color: #94A3B8; font-weight: 600;")
-        mt_layout.addWidget(addr_lbl)
+        self._lbl(c1, "Ключ доступа (Secret):")
+        self.secret_var = tk.StringVar(value=str(self._cfg.get("secret", DEFAULT_CONFIG["secret"])))
+        self._entry(c1, self.secret_var).pack(fill="x", ipady=4, pady=(2, 8))
 
-        addr_row = QHBoxLayout()
-        addr_row.setSpacing(6)
-        self.host_edit = QLineEdit(str(self._cfg.get("host", "127.0.0.1")))
-        self.host_edit.setMinimumWidth(110)
-        self.host_edit.setToolTip("IP-адрес локального прокси (обычно 127.0.0.1)")
-        self.port_spin = QSpinBox()
-        self.port_spin.setRange(1, 65535)
-        self.port_spin.setMinimumWidth(78)
-        self.port_spin.setValue(int(self._cfg.get("port", 1080)))
-        addr_row.addWidget(self.host_edit, 1)
-        addr_row.addWidget(self.port_spin)
-        mt_layout.addLayout(addr_row)
-
-        sec_lbl = QLabel("Ключ доступа (Secret):")
-        sec_lbl.setStyleSheet("font-size: 11px; color: #94A3B8; font-weight: 600;")
-        mt_layout.addWidget(sec_lbl)
-
-        self.secret_edit = QLineEdit(str(self._cfg.get("secret", DEFAULT_CONFIG["secret"])))
-        self.secret_edit.setMinimumWidth(110)
-        self.secret_edit.setPlaceholderText("32 hex-символа")
-        mt_layout.addWidget(self.secret_edit)
-
-        mt_btns = _FlowLayout(spacing=6)
-        gen_secret_btn = _make_btn("Обновить ключ")
-        gen_secret_btn.setToolTip("Сгенерировать новый случайный ключ")
-        gen_secret_btn.clicked.connect(self._generate_secret)
-        open_tg_btn = _make_btn("Открыть в Telegram")
-        open_tg_btn.setIcon(load_app_icon())
-        open_tg_btn.clicked.connect(lambda: _open_tg_link(self._current_preview_config()))
-        mt_btns.addWidget(open_tg_btn)
-        mt_btns.addWidget(gen_secret_btn)
-        mt_layout.addLayout(mt_btns)
-        body.addWidget(mt_group)
-
-        # Card 2: Cloudflare & TSPU bypass (minimalist by default)
-        cf_group = QGroupBox("Cloudflare и обход ТСПУ")
-        cf_layout = QVBoxLayout(cf_group)
-        cf_layout.setSpacing(8)
-
-        dom_lbl = QLabel("Свой Worker (опционально — пустое поле = публичный пул CF):")
-        dom_lbl.setWordWrap(True)
-        dom_lbl.setStyleSheet("font-size: 11px; color: #94A3B8; font-weight: 600;")
-        cf_layout.addWidget(dom_lbl)
-
-        self.domain_edit = QLineEdit(str(self._cfg.get("worker_domain", DEFAULT_CONFIG["worker_domain"])))
-        self.domain_edit.setMinimumWidth(120)
-        self.domain_edit.setPlaceholderText("Авто — публичный пул CF (20 доменов)")
-        cf_layout.addWidget(self.domain_edit)
-
-        bypass_lbl = QLabel("Способ обхода:")
-        bypass_lbl.setStyleSheet("font-size: 11px; color: #94A3B8; font-weight: 600;")
-        cf_layout.addWidget(bypass_lbl)
-
-        self.bypass_combo = QComboBox()
-        self.bypass_combo.addItem("Автоподбор (Port 443 / Port 80 / WinDivert)", "auto")
-        self.bypass_combo.addItem("CF Port 80 (без TLS и без WinDivert)", "port80")
-        self.bypass_combo.addItem("Встроенный WinDivert (winws.exe)", "windivert")
-        self.bypass_combo.addItem("Фрагментация TLS ClientHello (порт 443)", "tls_frag")
-        self.bypass_combo.addItem("Прямой / Внешний zapret (порт 443)", "direct")
-        cur_bypass = str(self._cfg.get("bypass_mode", "auto")).lower()
-        b_idx = self.bypass_combo.findData(cur_bypass)
-        self.bypass_combo.setCurrentIndex(max(0, b_idx))
-        cf_layout.addWidget(self.bypass_combo)
-
-        dom_btns = _FlowLayout(spacing=6)
-        self.test_btn = _make_btn("Тест соединения", min_width=120)
-        self.test_btn.clicked.connect(self._run_connectivity_test)
-        auto_dom_btn = _make_btn("Публичный пул (Авто)")
-        auto_dom_btn.setToolTip("Очистить поле и использовать встроенные публичные домены Cloudflare")
-        auto_dom_btn.clicked.connect(lambda: self.domain_edit.setText(""))
-        dom_btns.addWidget(self.test_btn)
-        dom_btns.addWidget(auto_dom_btn)
-        cf_layout.addLayout(dom_btns)
-
-        self._test_result_lbl = QLabel("")
-        self._test_result_lbl.setWordWrap(True)
-        self._test_result_lbl.setStyleSheet("font-size: 12px; color: #94A3B8;")
-        self._test_result_lbl.hide()
-        cf_layout.addWidget(self._test_result_lbl)
-
-        self.auto_tune_cb = QCheckBox("Автоподбор обхода (Port 80 / TLS / WinDivert)")
-        self.auto_tune_cb.setChecked(bool(self._cfg.get("auto_tune", True)))
-        cf_layout.addWidget(self.auto_tune_cb)
-
-        self.autostart_cb = QCheckBox("Запускать вместе с Windows")
-        self.autostart_cb.setChecked(bool(self._cfg.get("autostart", False)))
-        cf_layout.addWidget(self.autostart_cb)
-
-        # Collapsible advanced section
-        self._adv_toggle_btn = _make_btn("Дополнительно ▸", object_name="linkBtn")
-        self._adv_toggle_btn.clicked.connect(self._toggle_advanced)
-        cf_layout.addWidget(self._adv_toggle_btn)
-
-        self._adv_widget = QWidget()
-        self._adv_widget.setVisible(False)
-        adv_layout = QVBoxLayout(self._adv_widget)
-        adv_layout.setContentsMargins(0, 4, 0, 0)
-        adv_layout.setSpacing(8)
-
-        adv_form = QFormLayout()
-        adv_form.setSpacing(8)
-        adv_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
-
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItem("Авто (V1 / V2)", "auto")
-        self.mode_combo.addItem("V1 — WebSocket стриминг", "v1")
-        self.mode_combo.addItem("V2 — Карусельный синк", "v2")
-        cur_mode = str(self._cfg.get("mode", "auto")).lower()
-        idx = self.mode_combo.findData(cur_mode)
-        self.mode_combo.setCurrentIndex(max(0, idx))
-        adv_form.addRow("Режим работы:", self.mode_combo)
-
-        self.pool_spin = QSpinBox()
-        self.pool_spin.setRange(0, 10)
-        self.pool_spin.setValue(int(self._cfg.get("pool_size", 3)))
-        self.pool_spin.setToolTip("Прогретых сокетов на активный DC")
-        adv_form.addRow("Пул сокетов на DC:", self.pool_spin)
-        adv_layout.addLayout(adv_form)
-
-        self.frag_cb = QCheckBox("Фрагментация TLS ClientHello")
-        self.frag_cb.setChecked(bool(self._cfg.get("frag_tls", False)))
-        adv_layout.addWidget(self.frag_cb)
-
-        self.builtin_desync_cb = QCheckBox("Встроенный обход WinDivert (если Port 80 закрыт)")
-        self.builtin_desync_cb.setChecked(bool(self._cfg.get("builtin_desync", True)))
-        adv_layout.addWidget(self.builtin_desync_cb)
-
-        log_row = _FlowLayout(spacing=8)
-        self.verbose_cb = QCheckBox("Подробный лог (Debug)")
-        self.verbose_cb.setChecked(bool(self._cfg.get("verbose", False)))
-        log_row.addWidget(self.verbose_cb)
-
-        self.log_mb_spin = QDoubleSpinBox()
-        self.log_mb_spin.setRange(0.5, 100.0)
-        self.log_mb_spin.setSingleStep(1.0)
-        self.log_mb_spin.setSuffix(" МБ")
-        self.log_mb_spin.setValue(float(self._cfg.get("log_max_mb", 5)))
-        self.log_mb_spin.setFixedWidth(92)
-        log_row.addWidget(self.log_mb_spin)
-
-        logs_btn = _make_btn("Открыть логи")
-        logs_btn.clicked.connect(self._open_logs)
-        log_row.addWidget(logs_btn)
-        adv_layout.addLayout(log_row)
-
-        cf_layout.addWidget(self._adv_widget)
-        body.addWidget(cf_group)
-        body.addStretch(1)
-
-        scroll.setWidget(content)
-        outer.addWidget(scroll, 1)
-
-        # Responsive footer buttons (auto-wrap when window narrows)
-        footer = _FlowLayout(spacing=8)
-        self.toggle_srv_btn = _make_btn("Остановить сервер")
-        self.toggle_srv_btn.clicked.connect(self._handle_toggle_server)
-        footer.addWidget(self.toggle_srv_btn)
-
-        guide_btn = _make_btn("Инструкция")
-        guide_btn.clicked.connect(self._open_guide)
-        footer.addWidget(guide_btn)
-
-        unload_btn = _make_btn(
-            "Выгрузить",
-            object_name="dangerBtn",
-            tooltip="Остановить прокси, выгрузить WinDivert и закрыть FreeTG.exe",
+        mt_btns = _WrapFrame(c1, bg=_CARD_BG)
+        mt_btns.pack(fill="x")
+        mt_btns.add_widget(
+            _make_btn(mt_btns, "Открыть в Telegram", lambda: _open_tg_link(self._current_preview_config(), root=self.win))
         )
-        unload_btn.clicked.connect(self._handle_full_exit)
-        footer.addWidget(unload_btn)
+        mt_btns.add_widget(_make_btn(mt_btns, "Обновить ключ", lambda: self.secret_var.set(os.urandom(16).hex())))
 
-        cancel_btn = _make_btn("Отмена")
-        cancel_btn.clicked.connect(self.reject)
-        footer.addWidget(cancel_btn)
+        # Card 2: Cloudflare & Bypass
+        c2 = self._make_card(body, "Cloudflare и обход ТСПУ")
+        self._lbl(c2, "Свой Worker (опционально — пустое поле = публичный пул CF):")
+        self.domain_var = tk.StringVar(value=str(self._cfg.get("worker_domain", "")))
+        self._entry(c2, self.domain_var).pack(fill="x", ipady=4, pady=(2, 6))
 
-        save_btn = _make_btn("Сохранить", object_name="primaryBtn", min_width=105)
-        save_btn.clicked.connect(self._on_save)
-        footer.addWidget(save_btn)
-        outer.addLayout(footer)
+        dom_btns = _WrapFrame(c2, bg=_CARD_BG)
+        dom_btns.pack(fill="x", pady=(0, 8))
+        self.test_btn = _make_btn(dom_btns, "Тест соединения", self._run_connectivity_test)
+        dom_btns.add_widget(self.test_btn)
+        dom_btns.add_widget(_make_btn(dom_btns, "Публичный пул (Авто)", lambda: self.domain_var.set("")))
+
+        self._test_result_lbl = tk.Label(
+            c2, text="", bg=_CARD_BG, fg=_MUTED, font=("Segoe UI", 9), anchor="w", justify="left", wraplength=420
+        )
+
+        self._lbl(c2, "Способ обхода:")
+        self._bypass_combo = self._make_combo(c2, self._bypass_items, str(self._cfg.get("bypass_mode", "auto")).lower())
+        self._bypass_combo.pack(fill="x", pady=(2, 8))
+
+        self._lbl(c2, "Профиль zapret2 (Lua):")
+        self._profile_combo = self._make_combo(c2, self._PROFILE_ITEMS, str(self._cfg.get("desync_profile", "auto")).lower())
+        self._profile_combo.pack(fill="x", pady=(2, 8))
+
+        self.auto_tune_var = tk.BooleanVar(value=bool(self._cfg.get("auto_tune", True)))
+        self.autostart_var = tk.BooleanVar(value=bool(self._cfg.get("autostart", False)))
+        self._check(c2, "Автоподбор обхода (443 → Port 80 → TLS → zapret2)", self.auto_tune_var).pack(anchor="w", pady=2)
+        self._check(c2, "Запускать вместе с Windows", self.autostart_var).pack(anchor="w", pady=2)
+
+        self._adv_toggle_btn = tk.Button(
+            c2, text="Дополнительно ▸", command=self._toggle_advanced,
+            bg=_CARD_BG, fg=_MUTED, activebackground=_CARD_BG, activeforeground=_ACCENT_HOVER,
+            relief="flat", bd=0, anchor="w", cursor="hand2", font=("Segoe UI", 9, "bold"),
+        )
+        self._adv_toggle_btn.pack(anchor="w", pady=(6, 0))
+
+        self._adv_frame = tk.Frame(c2, bg=_CARD_BG)
+        self._lbl(self._adv_frame, "Режим работы (для своего Worker):")
+        self._mode_combo = self._make_combo(self._adv_frame, self._MODE_ITEMS, str(self._cfg.get("mode", "auto")).lower())
+        self._mode_combo.pack(fill="x", pady=(2, 6))
+
+        pool_row = tk.Frame(self._adv_frame, bg=_CARD_BG)
+        pool_row.pack(fill="x", pady=(0, 6))
+        tk.Label(pool_row, text="Пул сокетов на DC:", bg=_CARD_BG, fg=_MUTED, font=("Segoe UI", 9)).pack(side="left")
+        self.pool_var = tk.StringVar(value=str(self._cfg.get("pool_size", 3)))
+        tk.Spinbox(
+            pool_row, from_=0, to=10, textvariable=self.pool_var, width=6,
+            bg=_INPUT_BG, fg="#F8FAFC", buttonbackground=_BTN_BG, relief="flat",
+            highlightthickness=1, highlightbackground=_INPUT_BORDER, font=("Segoe UI", 9),
+        ).pack(side="right", ipady=2)
+
+        self.frag_var = tk.BooleanVar(value=bool(self._cfg.get("frag_tls", False)))
+        self.builtin_desync_var = tk.BooleanVar(value=bool(self._cfg.get("builtin_desync", True)))
+        self.verbose_var = tk.BooleanVar(value=bool(self._cfg.get("verbose", False)))
+        self._check(self._adv_frame, "Фрагментация TLS ClientHello", self.frag_var).pack(anchor="w", pady=2)
+        self._check(self._adv_frame, "Встроенный zapret2 (если 443 и Port 80 закрыты)", self.builtin_desync_var).pack(anchor="w", pady=2)
+
+        log_row = _WrapFrame(self._adv_frame, bg=_CARD_BG)
+        log_row.pack(fill="x", pady=(4, 0))
+        log_row.add_widget(self._check(log_row, "Подробный лог", self.verbose_var))
+        self.log_mb_var = tk.StringVar(value=str(self._cfg.get("log_max_mb", 5)))
+        mb_wrap = tk.Frame(log_row, bg=_CARD_BG)
+        tk.Spinbox(
+            mb_wrap, from_=1, to=100, textvariable=self.log_mb_var, width=5,
+            bg=_INPUT_BG, fg="#F8FAFC", buttonbackground=_BTN_BG, relief="flat",
+            highlightthickness=1, highlightbackground=_INPUT_BORDER, font=("Segoe UI", 9),
+        ).pack(side="left", ipady=2)
+        tk.Label(mb_wrap, text=" МБ", bg=_CARD_BG, fg=_MUTED, font=("Segoe UI", 9)).pack(side="left")
+        log_row.add_widget(mb_wrap)
+        log_row.add_widget(_make_btn(log_row, "Открыть логи", self._open_logs))
+
+        # Responsive footer
+        footer = _WrapFrame(outer, bg=_BG)
+        footer.pack(fill="x", pady=(10, 0))
+        self.toggle_srv_btn = _make_btn(footer, "Остановить сервер", self._handle_toggle_server)
+        footer.add_widget(self.toggle_srv_btn)
+        footer.add_widget(_make_btn(footer, "Инструкция", self._open_guide))
+        footer.add_widget(_make_btn(footer, "Выгрузить", self._handle_full_exit, danger=True))
+        footer.add_widget(_make_btn(footer, "Отмена", self.win.destroy))
+        footer.add_widget(_make_btn(footer, "Сохранить", self._on_save, primary=True))
 
         self._refresh_status()
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._refresh_status)
-        self._timer.start(2000)
+        self._schedule_refresh()
+
+    @staticmethod
+    def _make_card(parent: tk.Misc, title: str) -> tk.Frame:
+        wrap = tk.Frame(parent, bg=_BG)
+        wrap.pack(fill="x", pady=(0, 10))
+        tk.Label(wrap, text=title, bg=_BG, fg=_ACCENT_HOVER, font=("Segoe UI", 9, "bold"), anchor="w").pack(fill="x", pady=(0, 3))
+        card = tk.Frame(wrap, bg=_CARD_BG, highlightbackground=_CARD_BORDER, highlightthickness=1)
+        card.pack(fill="x")
+        inner = tk.Frame(card, bg=_CARD_BG)
+        inner.pack(fill="x", padx=12, pady=10)
+        return inner
+
+    @staticmethod
+    def _lbl(parent: tk.Misc, text: str) -> None:
+        tk.Label(parent, text=text, bg=_CARD_BG, fg=_MUTED, font=("Segoe UI", 8, "bold"), anchor="w").pack(fill="x")
+
+    @staticmethod
+    def _entry(parent: tk.Misc, var: tk.StringVar) -> tk.Entry:
+        return tk.Entry(
+            parent, textvariable=var, bg=_INPUT_BG, fg="#F8FAFC", insertbackground="#F8FAFC",
+            relief="flat", highlightthickness=1, highlightbackground=_INPUT_BORDER, font=("Segoe UI", 9),
+        )
+
+    @staticmethod
+    def _check(parent: tk.Misc, text: str, var: tk.BooleanVar) -> tk.Checkbutton:
+        return tk.Checkbutton(
+            parent, text=text, variable=var, bg=parent.cget("bg"), fg=_TEXT,
+            selectcolor=_INPUT_BG, activebackground=parent.cget("bg"), activeforeground=_TEXT,
+            font=("Segoe UI", 9),
+        )
+
+    @staticmethod
+    def _make_combo(parent: tk.Misc, items: List[Tuple[str, str]], cur_val: str) -> ttk.Combobox:
+        labels = [lbl for _, lbl in items]
+        cb = ttk.Combobox(parent, values=labels, state="readonly", style="Dark.TCombobox", font=("Segoe UI", 9))
+        idx = next((i for i, (k, _) in enumerate(items) if k == cur_val), 0)
+        cb.current(idx)
+        cb._data_keys = [k for k, _ in items]  # type: ignore[attr-defined]
+        return cb
+
+    @staticmethod
+    def _combo_value(cb: ttk.Combobox) -> str:
+        idx = cb.current()
+        keys = getattr(cb, "_data_keys", [])
+        if 0 <= idx < len(keys):
+            return keys[idx]
+        return keys[0] if keys else "auto"
 
     def _toggle_advanced(self) -> None:
-        show = not self._adv_widget.isVisible()
-        self._adv_widget.setVisible(show)
-        self._adv_toggle_btn.setText("Дополнительно ▾" if show else "Дополнительно ▸")
-
-    def _open_guide(self) -> None:
-        if self._on_open_guide is not None:
-            self._on_open_guide()
+        self._adv_open = not self._adv_open
+        if self._adv_open:
+            self._adv_frame.pack(fill="x", pady=(6, 0))
+            self._adv_toggle_btn.configure(text="Дополнительно ▾")
         else:
-            FirstRunDialog(self._current_preview_config(), self).exec()
+            self._adv_frame.pack_forget()
+            self._adv_toggle_btn.configure(text="Дополнительно ▸")
+
+    def _schedule_refresh(self) -> None:
+        if self.win.winfo_exists():
+            self._refresh_status()
+            self.win.after(2000, self._schedule_refresh)
+
+    def _refresh_status(self) -> None:
+        if not self.win.winfo_exists():
+            return
+        st = self._controller.get_status_snapshot()
+        if st.get("running"):
+            self._status_lbl.configure(
+                fg=_ACCENT_HOVER,
+                text=(
+                    f"● Работает ({st['mode']}, {st.get('desync', 'прямой')}) • "
+                    f"Подкл: {st['active_conns']} • ↑ {st['tx']} / ↓ {st['rx']}"
+                ),
+            )
+            self.toggle_srv_btn.configure(text="Остановить сервер")
+        else:
+            err = st.get("err") or "остановлен"
+            self._status_lbl.configure(fg="#F87171", text=f"● Остановлен ({err})")
+            self.toggle_srv_btn.configure(text="Запустить сервер")
 
     def _handle_toggle_server(self) -> None:
         if self._on_toggle_server is not None:
-            self.toggle_srv_btn.setEnabled(False)
+            self.toggle_srv_btn.configure(state="disabled")
             self._on_toggle_server()
-            QTimer.singleShot(800, self._refresh_after_toggle)
+            self.win.after(800, lambda: self.win.winfo_exists() and (self.toggle_srv_btn.configure(state="normal"), self._refresh_status()))
         else:
             if self._controller.is_running():
                 self._controller.stop(timeout=4.0, stop_desync=True)
@@ -1578,32 +1388,16 @@ class SettingsDialog(QDialog):
                 self._controller.start(self._cfg)
             self._refresh_status()
 
-    def _refresh_after_toggle(self) -> None:
-        self.toggle_srv_btn.setEnabled(True)
-        self._refresh_status()
+    def _open_guide(self) -> None:
+        if self._on_open_guide is not None:
+            self._on_open_guide()
+        else:
+            FirstRunDialog(self.win, self._current_preview_config())
 
     def _handle_full_exit(self) -> None:
-        self.close()
+        self.win.destroy()
         if self._on_full_exit is not None:
             self._on_full_exit()
-
-    def _refresh_status(self) -> None:
-        st = self._controller.get_status_snapshot()
-        if st.get("running"):
-            self._status_lbl.setStyleSheet("font-size: 12px; color: #34D399;")
-            self._status_lbl.setText(
-                f"● Работает ({st['mode']}, {st.get('desync', 'прямой')}) • "
-                f"Подкл: {st['active_conns']} • ↑ {st['tx']} / ↓ {st['rx']}"
-            )
-            self.toggle_srv_btn.setText("Остановить сервер")
-        else:
-            err = st.get("err") or "остановлен"
-            self._status_lbl.setStyleSheet("font-size: 12px; color: #F87171;")
-            self._status_lbl.setText(f"● Остановлен ({err})")
-            self.toggle_srv_btn.setText("Запустить сервер")
-
-    def _generate_secret(self) -> None:
-        self.secret_edit.setText(os.urandom(16).hex())
 
     def _open_logs(self) -> None:
         if LOG_FILE.exists():
@@ -1611,222 +1405,239 @@ class SettingsDialog(QDialog):
                 os.startfile(str(LOG_FILE))
                 return
             except Exception as exc:
-                _show_message(self, f"Не удалось открыть лог:\n{exc}", APP_NAME, level="error")
+                messagebox.showerror(APP_NAME, f"Не удалось открыть лог:\n{exc}", parent=self.win)
         else:
-            _show_message(self, "Файл логов ещё не создан.", APP_NAME)
+            messagebox.showinfo(APP_NAME, "Файл логов ещё не создан.", parent=self.win)
 
     def _current_preview_config(self) -> Dict[str, Any]:
         c = dict(self._cfg)
-        c["host"] = self.host_edit.text().strip() or "127.0.0.1"
-        c["port"] = int(self.port_spin.value())
-        c["secret"] = self.secret_edit.text().strip() or DEFAULT_CONFIG["secret"]
-        c["worker_domain"] = sanitize_worker_domain(self.domain_edit.text())
+        c["host"] = self.host_var.get().strip() or "127.0.0.1"
+        try:
+            c["port"] = int(self.port_var.get())
+        except ValueError:
+            c["port"] = int(self._cfg.get("port", 1080))
+        c["secret"] = self.secret_var.get().strip() or DEFAULT_CONFIG["secret"]
+        c["worker_domain"] = sanitize_worker_domain(self.domain_var.get())
         return c
 
     def _run_connectivity_test(self) -> None:
-        if self._test_worker is not None and self._test_worker.isRunning():
+        if self._testing:
             return
-        raw_domain = self.domain_edit.text().strip()
+        raw_domain = self.domain_var.get().strip()
         domain = sanitize_worker_domain(raw_domain)
         if raw_domain and not domain:
-            _show_message(self, "Укажите корректный домен Cloudflare Worker (или оставьте пустым для авто-пула).", APP_NAME)
+            messagebox.showwarning(
+                APP_NAME,
+                "Укажите корректный домен Cloudflare Worker (или оставьте пустым для авто-пула).",
+                parent=self.win,
+            )
             return
-        self.test_btn.setEnabled(False)
-        self.test_btn.setText("Проверка...")
-        self._test_result_lbl.setStyleSheet("font-size: 12px; color: #94A3B8;")
-        self._test_result_lbl.setText("Проверка >22 КБ через Cloudflare...")
-        self._test_result_lbl.show()
+        self._testing = True
+        self.test_btn.configure(state="disabled", text="Проверка...")
+        self._test_result_lbl.configure(fg=_MUTED, text="Проверка >22 КБ через Cloudflare...")
+        self._test_result_lbl.pack(fill="x", pady=(0, 8))
 
-        self._test_worker = _ConnectivityWorker(
-            domain,
-            str(self.mode_combo.currentData()),
-            self.frag_cb.isChecked(),
-            self.builtin_desync_cb.isChecked(),
-            self.auto_tune_cb.isChecked(),
-            bypass_mode=str(self.bypass_combo.currentData()),
-            controller=self._controller,
-            parent=self,
-        )
-        self._test_worker.finished_result.connect(self._on_test_finished)
-        self._test_worker.start()
+        bmode = self._combo_value(self._bypass_combo)
+        dprof = self._combo_value(self._profile_combo)
+        mode = self._combo_value(self._mode_combo)
+        frag = bool(self.frag_var.get())
+        b_desync = bool(self.builtin_desync_var.get())
+        a_tune = bool(self.auto_tune_var.get())
+
+        def _worker() -> None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                msg, eff_frag = loop.run_until_complete(
+                    test_worker_connectivity_async(
+                        domain,
+                        mode,
+                        frag,
+                        bypass_mode=bmode,
+                        desync_profile=dprof,
+                        builtin_desync=b_desync,
+                        auto_tune=a_tune,
+                        controller=self._controller,
+                    )
+                )
+            except Exception as exc:
+                msg, eff_frag = f"✗ Ошибка: {exc}", frag
+            finally:
+                loop.close()
+            if self.win.winfo_exists():
+                self.win.after(0, lambda: self._on_test_finished(msg, eff_frag))
+
+        threading.Thread(target=_worker, daemon=True, name="freetg-test").start()
 
     def _on_test_finished(self, message: str, effective_frag: bool) -> None:
-        self.test_btn.setEnabled(True)
-        self.test_btn.setText("Тест соединения")
-        if effective_frag and not self.frag_cb.isChecked():
-            self.frag_cb.setChecked(True)
-        color = "#34D399" if message.startswith("✓") else ("#FBBF24" if message.startswith("~") else "#F87171")
-        self._test_result_lbl.setStyleSheet(f"font-size: 12px; color: {color};")
-        self._test_result_lbl.setText(message)
-        self._test_result_lbl.show()
+        self._testing = False
+        if not self.win.winfo_exists():
+            return
+        self.test_btn.configure(state="normal", text="Тест соединения")
+        if effective_frag and not self.frag_var.get():
+            self.frag_var.set(True)
+        color = _ACCENT_HOVER if message.startswith("✓") else ("#FBBF24" if message.startswith("~") else "#F87171")
+        self._test_result_lbl.configure(fg=color, text=message)
+        self._test_result_lbl.pack(fill="x", pady=(0, 8))
 
     def _on_save(self) -> None:
-        host = self.host_edit.text().strip()
+        host = self.host_var.get().strip()
         try:
             socket.inet_aton(host)
         except OSError:
-            _show_message(self, "Некорректный IPv4-адрес для локального прокси.", APP_NAME, level="error")
+            messagebox.showerror(APP_NAME, "Некорректный IPv4-адрес для локального прокси.", parent=self.win)
             return
 
-        port = int(self.port_spin.value())
         try:
-            secret = normalize_secret(self.secret_edit.text()).hex()
-        except ValueError as exc:
-            _show_message(self, str(exc), APP_NAME, level="error")
+            port = int(self.port_var.get())
+            if not (1 <= port <= 65535):
+                raise ValueError
+        except ValueError:
+            messagebox.showerror(APP_NAME, "Порт должен быть от 1 до 65535.", parent=self.win)
             return
 
-        raw_domain = self.domain_edit.text().strip()
+        try:
+            secret = normalize_secret(self.secret_var.get()).hex()
+        except ValueError as exc:
+            messagebox.showerror(APP_NAME, str(exc), parent=self.win)
+            return
+
+        raw_domain = self.domain_var.get().strip()
         worker_domain = sanitize_worker_domain(raw_domain)
         if raw_domain and not worker_domain:
-            _show_message(self, "Укажите корректный домен Cloudflare Worker или очистите поле для публичного пула.", APP_NAME)
+            messagebox.showwarning(
+                APP_NAME,
+                "Укажите корректный домен Cloudflare Worker или очистите поле для публичного пула.",
+                parent=self.win,
+            )
             return
+
+        bypass_mode = self._combo_value(self._bypass_combo)
+        if bypass_mode in ("windivert", "windivert1") and desync_manager.is_external_winws_running():
+            if not messagebox.askyesno(
+                APP_NAME,
+                "В системе уже запущен внешний zapret/winws.\n"
+                "Встроенный модуль автоматически уступит ему (иначе два WinDivert сломают друг друга).\n\n"
+                "Сохранить настройку всё равно?",
+                parent=self.win,
+            ):
+                return
+
+        try:
+            pool_size = max(0, min(10, int(self.pool_var.get())))
+        except ValueError:
+            pool_size = int(self._cfg.get("pool_size", 3))
+        try:
+            log_max_mb = max(0.5, min(100.0, round(float(self.log_mb_var.get()), 2)))
+        except ValueError:
+            log_max_mb = float(self._cfg.get("log_max_mb", 5))
 
         new_cfg: Dict[str, Any] = {
             "host": host,
             "port": port,
             "secret": secret,
             "worker_domain": worker_domain,
-            "mode": str(self.mode_combo.currentData()),
-            "bypass_mode": str(self.bypass_combo.currentData()),
-            "pool_size": int(self.pool_spin.value()),
-            "frag_tls": self.frag_cb.isChecked(),
-            "builtin_desync": self.builtin_desync_cb.isChecked(),
-            "auto_tune": self.auto_tune_cb.isChecked(),
-            "verbose": self.verbose_cb.isChecked(),
-            "log_max_mb": round(float(self.log_mb_spin.value()), 2),
-            "autostart": self.autostart_cb.isChecked(),
+            "mode": self._combo_value(self._mode_combo),
+            "bypass_mode": bypass_mode,
+            "desync_profile": self._combo_value(self._profile_combo),
+            "pool_size": pool_size,
+            "frag_tls": bool(self.frag_var.get()),
+            "builtin_desync": bool(self.builtin_desync_var.get()),
+            "auto_tune": bool(self.auto_tune_var.get()),
+            "verbose": bool(self.verbose_var.get()),
+            "log_max_mb": log_max_mb,
+            "autostart": bool(self.autostart_var.get()),
         }
 
         if bool(new_cfg["autostart"]) != bool(self._cfg.get("autostart", False)) or new_cfg["autostart"]:
             ok, err = set_autostart_enabled(bool(new_cfg["autostart"]))
             if not ok:
-                _show_message(
-                    self, f"Не удалось обновить автозапуск в реестре:\n{err}", APP_NAME
-                )
+                messagebox.showwarning(APP_NAME, f"Не удалось обновить автозапуск в реестре:\n{err}", parent=self.win)
 
         restart_needed = any(new_cfg.get(k) != self._cfg.get(k) for k in _PROXY_RESTART_KEYS)
         save_config(new_cfg)
         set_verbose_logging(bool(new_cfg["verbose"]))
         self._on_applied(new_cfg, restart_needed)
-        self.accept()
-
-
-class _UiBridge(QObject):
-    error_signal = pyqtSignal(str)
-    restarted_signal = pyqtSignal(bool, str)
-    autotune_signal = pyqtSignal(object, str)
+        self.win.destroy()
 
 
 class FreeTGTrayApplication:
-    """System tray manager wrapping QApplication, QSystemTrayIcon, and ProxyController."""
+    """Lightweight tkinter + native Win32 Tray manager wrapping ProxyController."""
 
     def __init__(self, cfg: Dict[str, Any]) -> None:
+        enable_high_dpi()
         self.cfg = cfg
         self.controller = ProxyController()
-        self.app = QApplication(sys.argv)
-        self.app.setApplicationName(APP_NAME)
-        self.app.setQuitOnLastWindowClosed(False)
-        self._app_icon = load_app_icon()
-        self.app.setWindowIcon(self._app_icon)
-        self.app.setStyleSheet(_APP_STYLESHEET)
+        self._ui_queue: queue.SimpleQueue[Callable[[], None]] = queue.SimpleQueue()
+        self._exiting = False
 
-        self.bridge = _UiBridge()
-        self.bridge.error_signal.connect(self._show_error_dialog)
-        self.bridge.restarted_signal.connect(self._on_restart_finished)
-        self.bridge.autotune_signal.connect(self._on_autotune_notice)
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.root.configure(bg=_BG)
+        _style_ttk(self.root)
 
         self._settings_dlg: Optional[SettingsDialog] = None
         self._first_run_dlg: Optional[FirstRunDialog] = None
-        self._exiting = False
 
-        self.tray = QSystemTrayIcon(self._app_icon, self.app)
-        self.tray.activated.connect(self._on_tray_activated)
-        self._open_tg_action: Optional[QAction] = None
-        self._toggle_server_action: Optional[QAction] = None
-        self._build_tray_menu()
+        ico_path = resource_path("icon.ico")
+        self.tray = Win32TrayIcon(
+            ico_path if ico_path.exists() else None,
+            self._tooltip_text(),
+            on_activate=lambda: self._post(self._open_settings),
+            menu_builder=self._build_tray_menu,
+        )
 
-    def _build_tray_menu(self) -> None:
-        menu = QMenu()
-        host = get_link_host(str(self.cfg.get("host", "127.0.0.1")))
-        port = int(self.cfg.get("port", 1080))
+    def _post(self, fn: Callable[[], None]) -> None:
+        self._ui_queue.put(fn)
 
-        self._open_tg_action = QAction(self._app_icon, f"Открыть в Telegram ({host}:{port})", menu)
-        font = self._open_tg_action.font()
-        font.setBold(True)
-        self._open_tg_action.setFont(font)
-        self._open_tg_action.triggered.connect(lambda: _open_tg_link(self.cfg, self.tray, self._app_icon))
-        menu.addAction(self._open_tg_action)
+    def _pump_ui_queue(self) -> None:
+        if self._exiting:
+            return
+        while True:
+            try:
+                fn = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
+            except Exception:
+                log.exception("UI callback failed")
+        if not self._exiting:
+            self.root.after(100, self._pump_ui_queue)
 
-        copy_act = QAction("Скопировать ссылку", menu)
-        copy_act.triggered.connect(self._on_copy_link)
-        menu.addAction(copy_act)
-
-        menu.addSeparator()
-
-        self._toggle_server_action = QAction("Остановить сервер", menu)
-        self._toggle_server_action.triggered.connect(self._on_toggle_server_clicked)
-        menu.addAction(self._toggle_server_action)
-
-        restart_act = QAction("Перезапустить прокси", menu)
-        restart_act.triggered.connect(self._on_restart_clicked)
-        menu.addAction(restart_act)
-
-        settings_act = QAction("Настройки...", menu)
-        settings_act.triggered.connect(self._open_settings)
-        menu.addAction(settings_act)
-
-        guide_act = QAction("Инструкция подключения", menu)
-        guide_act.triggered.connect(lambda: self._open_first_run(force=True))
-        menu.addAction(guide_act)
-
-        logs_act = QAction("Открыть логи", menu)
-        logs_act.triggered.connect(self._on_open_logs)
-        menu.addAction(logs_act)
-
-        menu.addSeparator()
-
-        exit_act = QAction("Выход (выгрузить полностью)", menu)
-        exit_act.triggered.connect(self._on_exit)
-        menu.addAction(exit_act)
-
-        self.tray.setContextMenu(menu)
-        self._update_tooltip()
-
-    def _update_tooltip(self) -> None:
+    def _tooltip_text(self) -> str:
         host = get_link_host(str(self.cfg.get("host", "127.0.0.1")))
         port = int(self.cfg.get("port", 1080))
         domain = self.cfg.get("worker_domain", "") or "публичный пул CF"
+        state = "работает" if self.controller.is_running() else "остановлен"
+        return f"{APP_NAME} v{__version__} — {state}\n{host}:{port} ({domain})"
+
+    def _update_tooltip(self) -> None:
+        self.tray.set_tooltip(self._tooltip_text())
+
+    def _build_tray_menu(self):
+        host = get_link_host(str(self.cfg.get("host", "127.0.0.1")))
+        port = int(self.cfg.get("port", 1080))
         running = self.controller.is_running()
-        state = "работает" if running else "остановлен"
-        self.tray.setToolTip(f"{APP_NAME} v{__version__} — {state}\n{host}:{port} ({domain})")
-        if self._open_tg_action is not None:
-            self._open_tg_action.setText(f"Открыть в Telegram ({host}:{port})")
-        if self._toggle_server_action is not None:
-            self._toggle_server_action.setText(
-                "Остановить сервер" if running else "Запустить сервер"
-            )
-
-    def _show_error_dialog(self, msg: str) -> None:
-        _show_message(None, msg, f"{APP_NAME} — Ошибка", level="error")
-
-    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
-        if reason in (
-            QSystemTrayIcon.ActivationReason.DoubleClick,
-            QSystemTrayIcon.ActivationReason.Trigger,
-        ):
-            self._open_settings()
+        return [
+            (f"Открыть в Telegram ({host}:{port})", lambda: self._post(lambda: _open_tg_link(self.cfg, self.tray, self.root)), True),
+            ("Скопировать ссылку", lambda: self._post(self._on_copy_link), False),
+            (None, None, False),
+            ("Остановить сервер" if running else "Запустить сервер", lambda: self._post(self._on_toggle_server_clicked), False),
+            ("Перезапустить прокси", lambda: self._post(self._on_restart_clicked), False),
+            ("Настройки...", lambda: self._post(self._open_settings), False),
+            ("Инструкция подключения", lambda: self._post(lambda: self._open_first_run(force=True)), False),
+            ("Открыть логи", lambda: self._post(self._on_open_logs), False),
+            (None, None, False),
+            ("Выход (выгрузить полностью)", lambda: self._post(self._on_exit), False),
+        ]
 
     def _on_copy_link(self) -> None:
         url = tg_proxy_url(self.cfg)
-        cb = QApplication.clipboard()
-        if cb is not None:
-            cb.setText(url)
-            self.tray.showMessage(
-                APP_NAME,
-                f"Ссылка скопирована:\n{url}",
-                self._app_icon,
-                4000,
-            )
+        self.root.clipboard_clear()
+        self.root.clipboard_append(url)
+        self.root.update()
+        self.tray.show_notification(APP_NAME, f"Ссылка скопирована:\n{url}")
 
     def _on_open_logs(self) -> None:
         if LOG_FILE.exists():
@@ -1834,31 +1645,27 @@ class FreeTGTrayApplication:
                 os.startfile(str(LOG_FILE))
                 return
             except Exception as exc:
-                self._show_error_dialog(f"Не удалось открыть лог:\n{exc}")
+                show_native_info(f"Не удалось открыть лог:\n{exc}", f"{APP_NAME} — Ошибка", error=True)
         else:
-            _show_message(None, "Файл логов ещё не создан.", APP_NAME)
+            show_native_info("Файл логов ещё не создан.", APP_NAME)
 
     def _on_toggle_server_clicked(self) -> None:
         if self.controller.is_running():
-            threading.Thread(
-                target=self._stop_server_background, daemon=True, name="proxy-stop"
-            ).start()
+            threading.Thread(target=self._stop_server_background, daemon=True, name="proxy-stop").start()
         else:
-            threading.Thread(
-                target=self._start_server_background, daemon=True, name="proxy-start"
-            ).start()
+            threading.Thread(target=self._start_server_background, daemon=True, name="proxy-start").start()
 
     def _stop_server_background(self) -> None:
         log.info("Stopping server by user request")
         self.controller.stop(timeout=4.0, stop_desync=True)
-        self.bridge.restarted_signal.emit(False, "Сервер полностью остановлен")
+        self._post(lambda: self._on_restart_finished(False, "Сервер полностью остановлен"))
 
     def _start_server_background(self) -> None:
         ok, err = self.controller.start(
             self.cfg,
-            on_error=lambda msg: self.bridge.error_signal.emit(msg),
+            on_error=lambda msg: self._post(lambda: show_native_info(msg, f"{APP_NAME} — Ошибка", error=True)),
         )
-        self.bridge.restarted_signal.emit(ok, err or "")
+        self._post(lambda: self._on_restart_finished(ok, err or ""))
 
     def _on_restart_clicked(self) -> None:
         threading.Thread(target=self._restart_background, daemon=True, name="proxy-restart").start()
@@ -1866,56 +1673,43 @@ class FreeTGTrayApplication:
     def _restart_background(self) -> None:
         ok, err = self.controller.restart(
             self.cfg,
-            on_error=lambda msg: self.bridge.error_signal.emit(msg),
+            on_error=lambda msg: self._post(lambda: show_native_info(msg, f"{APP_NAME} — Ошибка", error=True)),
         )
-        self.bridge.restarted_signal.emit(ok, err or "")
+        self._post(lambda: self._on_restart_finished(ok, err or ""))
 
     def _on_restart_finished(self, ok: bool, err: str) -> None:
         self._update_tooltip()
         if ok:
             self.controller.run_auto_tune_async(
                 self.cfg,
-                on_notice=lambda new_cfg, msg: self.bridge.autotune_signal.emit(new_cfg, msg),
+                on_notice=lambda new_cfg, msg: self._post(lambda: self._on_autotune_notice(new_cfg, msg)),
             )
             self.controller.start_zapret_watcher(
                 self.cfg,
-                on_notice=lambda new_cfg, msg: self.bridge.autotune_signal.emit(new_cfg, msg),
+                on_notice=lambda new_cfg, msg: self._post(lambda: self._on_autotune_notice(new_cfg, msg)),
             )
             host = get_link_host(str(self.cfg.get("host", "127.0.0.1")))
             port = int(self.cfg.get("port", 1080))
-            self.tray.showMessage(
-                APP_NAME,
-                f"Прокси запущен на {host}:{port}",
-                self._app_icon,
-                3000,
-            )
+            self.tray.show_notification(APP_NAME, f"Прокси запущен на {host}:{port}")
         elif err == "Сервер полностью остановлен":
-            self.tray.showMessage(
-                APP_NAME,
-                "Сервер и встроенный WinDivert остановлены.",
-                self._app_icon,
-                3000,
-            )
+            self.tray.show_notification(APP_NAME, "Сервер и встроенный zapret2 остановлены.")
 
     def _on_autotune_notice(self, new_cfg: object, msg: str) -> None:
         if isinstance(new_cfg, dict):
             self.cfg = new_cfg
             self.controller.update_watch_config(self.cfg)
         self._update_tooltip()
-        self.tray.showMessage(
-            APP_NAME,
-            msg,
-            self._app_icon,
-            4500,
-        )
+        self.tray.show_notification(APP_NAME, msg)
 
     def _open_settings(self) -> None:
-        if self._settings_dlg is not None and self._settings_dlg.isVisible():
-            self._settings_dlg.raise_()
-            self._settings_dlg.activateWindow()
+        if self._settings_dlg is not None and self._settings_dlg.win.winfo_exists():
+            self._settings_dlg.win.deiconify()
+            self._settings_dlg.win.lift()
+            self._settings_dlg.win.focus_force()
             return
         self.cfg["autostart"] = load_config().get("autostart", self.cfg.get("autostart", False))
-        dlg = SettingsDialog(
+        self._settings_dlg = SettingsDialog(
+            self.root,
             self.cfg,
             self.controller,
             self._on_settings_applied,
@@ -1923,10 +1717,7 @@ class FreeTGTrayApplication:
             on_full_exit=self._on_exit,
             on_open_guide=lambda: self._open_first_run(force=True),
         )
-        self._settings_dlg = dlg
-        dlg.show()
-        dlg.raise_()
-        dlg.activateWindow()
+        self._settings_dlg.win.lift()
 
     def _on_settings_applied(self, new_cfg: Dict[str, Any], restart_needed: bool) -> None:
         self.cfg = new_cfg
@@ -1935,92 +1726,81 @@ class FreeTGTrayApplication:
         if restart_needed:
             self._on_restart_clicked()
         else:
-            self.tray.showMessage(
-                APP_NAME,
-                "Настройки сохранены.",
-                self._app_icon,
-                2500,
-            )
+            self.tray.show_notification(APP_NAME, "Настройки сохранены.")
 
     def _open_first_run(self, *, force: bool = False) -> None:
         ensure_dirs()
         if not force and FIRST_RUN_MARKER.exists():
             return
-        if self._first_run_dlg is not None and self._first_run_dlg.isVisible():
-            self._first_run_dlg.raise_()
-            self._first_run_dlg.activateWindow()
+        if self._first_run_dlg is not None and self._first_run_dlg.win.winfo_exists():
+            self._first_run_dlg.win.deiconify()
+            self._first_run_dlg.win.lift()
+            self._first_run_dlg.win.focus_force()
             return
-        dlg = FirstRunDialog(self.cfg)
+        dlg = FirstRunDialog(self.root, self.cfg)
         self._first_run_dlg = dlg
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            if getattr(dlg, "dont_show_again", True):
-                try:
-                    FIRST_RUN_MARKER.touch()
-                except OSError:
-                    pass
-            if dlg.open_on_finish:
-                _open_tg_link(self.cfg, self.tray, self._app_icon)
+        self.root.wait_window(dlg.win)
+        if dlg.accepted and dlg.dont_show_again:
+            try:
+                FIRST_RUN_MARKER.touch()
+            except OSError:
+                pass
 
     def _on_exit(self) -> None:
         if self._exiting:
             return
         self._exiting = True
         log.info("Exiting FreeTG tray application")
-        self.tray.hide()
+        self.tray.stop()
         for dlg in (self._settings_dlg, self._first_run_dlg):
             if dlg is not None:
                 try:
-                    dlg.close()
+                    if dlg.win.winfo_exists():
+                        dlg.win.destroy()
                 except Exception:
                     pass
-        threading.Thread(
-            target=lambda: (time.sleep(2.0), os._exit(0)),
-            daemon=True,
-            name="force-exit",
-        ).start()
+        threading.Thread(target=lambda: (time.sleep(2.0), os._exit(0)), daemon=True, name="force-exit").start()
         self.controller.stop(timeout=2.5, stop_desync=True)
         desync_manager.stop()
         release_single_instance_mutex()
-        self.app.quit()
+        try:
+            self.root.quit()
+            self.root.destroy()
+        except Exception:
+            pass
 
     def run(self) -> int:
-        if not QSystemTrayIcon.isSystemTrayAvailable():
-            log.warning("System tray reports unavailable; continuing anyway")
-
-        self.tray.show()
+        self.tray.start()
         ok, err = self.controller.start(
             self.cfg,
-            on_error=lambda msg: self.bridge.error_signal.emit(msg),
+            on_error=lambda msg: self._post(lambda: show_native_info(msg, f"{APP_NAME} — Ошибка", error=True)),
         )
         self._update_tooltip()
 
         if ok:
             self.controller.run_auto_tune_async(
                 self.cfg,
-                on_notice=lambda new_cfg, msg: self.bridge.autotune_signal.emit(new_cfg, msg),
+                on_notice=lambda new_cfg, msg: self._post(lambda: self._on_autotune_notice(new_cfg, msg)),
             )
             self.controller.start_zapret_watcher(
                 self.cfg,
-                on_notice=lambda new_cfg, msg: self.bridge.autotune_signal.emit(new_cfg, msg),
+                on_notice=lambda new_cfg, msg: self._post(lambda: self._on_autotune_notice(new_cfg, msg)),
             )
             if not FIRST_RUN_MARKER.exists():
-                QTimer.singleShot(250, lambda: self._open_first_run(force=True))
+                self.root.after(250, lambda: self._open_first_run(force=True))
             else:
                 host = get_link_host(str(self.cfg.get("host", "127.0.0.1")))
                 port = int(self.cfg.get("port", 1080))
-                self.tray.showMessage(
-                    APP_NAME,
-                    f"Прокси запущен: {host}:{port}",
-                    self._app_icon,
-                    3000,
-                )
+                self.tray.show_notification(APP_NAME, f"Прокси запущен: {host}:{port}")
         elif err:
-            QTimer.singleShot(200, self._open_settings)
+            self.root.after(200, self._open_settings)
 
-        exit_code = self.app.exec()
+        self.root.after(100, self._pump_ui_queue)
+        self.root.mainloop()
+        self.tray.stop()
         self.controller.stop(timeout=3.0)
         desync_manager.stop()
-        return exit_code
+        return 0
 
 
 def run_tray_main() -> int:
@@ -2031,10 +1811,7 @@ def run_tray_main() -> int:
             pass
 
     if not acquire_single_instance_mutex():
-        show_native_info(
-            "Приложение FreeTG уже запущено, проверьте системный трей.",
-            APP_NAME,
-        )
+        show_native_info("Приложение FreeTG уже запущено, проверьте системный трей.", APP_NAME)
         return 0
 
     try:
@@ -2044,7 +1821,7 @@ def run_tray_main() -> int:
             log_max_mb=float(cfg.get("log_max_mb", 5)),
         )
         save_config(cfg)
-        log.info("Starting %s v%s (AES=%s)", APP_NAME, __version__, AES_BACKEND_NAME)
+        log.info("Starting %s v%s (AES=%s, UI=tkinter)", APP_NAME, __version__, AES_BACKEND_NAME)
         tray_app = FreeTGTrayApplication(cfg)
         return tray_app.run()
     finally:

@@ -14,10 +14,37 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        'PyQt6',
+        'PyQt5',
+        'PySide6',
+        'PIL',
+        'Pillow',
+        'pytest',
+        'unittest',
+        'pydoc',
+        'doctest',
+        'xmlrpc',
+        'lib2to3',
+        'setuptools',
+        'pkg_resources',
+        'distutils',
+        'sqlite3',
+    ],
     noarchive=False,
     optimize=0,
 )
+
+# Drop root-level duplicate cygwin1.dll (staged safely inside assets/winws/)
+a.binaries = [b for b in a.binaries if os.path.basename(b[0]).lower() != 'cygwin1.dll']
+
+# Drop bulky non-runtime Tcl/Tk tzdata & demo files
+a.datas = [
+    d for d in a.datas
+    if not any(seg in d[0].replace('\\', '/').lower() for seg in ('/tzdata/', '/demos/', '/msgs/', '/images/'))
+    or d[0].replace('\\', '/').lower().startswith('assets/')
+]
+
 pyz = PYZ(a.pure)
 
 exe = EXE(

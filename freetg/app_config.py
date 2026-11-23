@@ -32,6 +32,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "worker_domain": DEFAULT_WORKER_DOMAIN,
     "mode": "auto",
     "bypass_mode": "auto",
+    "desync_profile": "auto",
     "pool_size": 3,
     "frag_tls": False,
     "builtin_desync": True,
@@ -190,7 +191,7 @@ def to_freetg_config(cfg: Dict[str, Any], *, stats_interval: float = 30.0) -> Fr
     if mode not in ("auto", "v1", "v2"):
         mode = "auto"
     bypass_mode = str(cfg.get("bypass_mode", "auto")).lower()
-    if bypass_mode not in ("auto", "port80", "windivert", "tls_frag", "direct"):
+    if bypass_mode not in ("auto", "port80", "windivert", "windivert1", "tls_frag", "direct"):
         bypass_mode = "auto"
     if bypass_mode == "port80":
         frag_tls = False
@@ -200,7 +201,7 @@ def to_freetg_config(cfg: Dict[str, Any], *, stats_interval: float = 30.0) -> Fr
         frag_tls = True
         prefer_port80_cf = False
         allow_port80_fallback = False
-    elif bypass_mode in ("windivert", "direct"):
+    elif bypass_mode in ("windivert", "windivert1", "direct"):
         frag_tls = False
         prefer_port80_cf = False
         allow_port80_fallback = False
@@ -218,6 +219,7 @@ def to_freetg_config(cfg: Dict[str, Any], *, stats_interval: float = 30.0) -> Fr
         frag_tls=frag_tls,
         prefer_port80_cf=prefer_port80_cf,
         allow_port80_fallback=allow_port80_fallback,
+        auto_tls_frag=False,
         stats_interval=stats_interval,
         verbose=bool(cfg.get("verbose", False)),
     )

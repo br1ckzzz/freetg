@@ -43,7 +43,9 @@ def run_selftest() -> int:
     test_cfg["mode"] = "v1"
     test_cfg["builtin_desync"] = False
     test_cfg["auto_tune"] = False
-    winws_exe = resource_path("assets/winws/winws.exe")
+    winws2_exe = resource_path("assets/winws/winws2.exe")
+    lua_antidpi = resource_path("assets/winws/lua/zapret-antidpi.lua")
+    winws1_exe = resource_path("assets/winws/winws.exe")
 
     controller = ProxyController()
     ok, err = controller.start(test_cfg, stats_interval=0, wait_ready=10.0)
@@ -65,8 +67,9 @@ def run_selftest() -> int:
         "logo_path": str(logo_path),
         "icon_exists": icon_path.exists(),
         "icon_path": str(icon_path),
-        "winws_exists": winws_exe.exists(),
-        "winws_path": str(winws_exe),
+        "winws2_exists": winws2_exe.exists(),
+        "winws2_lua_exists": lua_antidpi.exists(),
+        "winws1_exists": winws1_exe.exists(),
         "bind_ok": ok,
         "tcp_ok": tcp_ok,
         "error": err,

@@ -119,7 +119,7 @@ def _decode_cfproxy_entry(entry: str) -> str:
 def _fetch_remote_public_domains_sync() -> List[str]:
     req = urllib.request.Request(
         CF_PUBLIC_DOMAINS_URL,
-        headers={"User-Agent": "FreeTG/0.2.2"},
+        headers={"User-Agent": "FreeTG/0.3.0-z2lite"},
     )
     with urllib.request.urlopen(req, timeout=6.0) as resp:
         raw = resp.read().decode("utf-8", errors="replace")
@@ -1023,6 +1023,7 @@ class DcCarouselPool:
         frag_tls: bool = False,
         prefer_port80_cf: bool = False,
         allow_port80_fallback: bool = True,
+        auto_tls_frag: bool = True,
         cf_ips: Optional[List[str]] = None,
         cf_ports: Optional[List[int]] = None,
     ):
@@ -1048,6 +1049,7 @@ class DcCarouselPool:
         self.frag_tls = frag_tls
         self.prefer_port80_cf = prefer_port80_cf
         self.allow_port80_fallback = allow_port80_fallback
+        self.auto_tls_frag = auto_tls_frag
         self.ssl_ctx = _create_ssl_context()
         self.stats = CarouselStats()
 
@@ -1103,7 +1105,7 @@ class DcCarouselPool:
             except Exception as exc:
                 log.debug("DNS resolution for %s skipped: %r", self.worker_domain, exc)
 
-        if not self.frag_tls and not self.prefer_port80_cf:
+        if self.auto_tls_frag and not self.frag_tls and not self.prefer_port80_cf:
             probe_eps = list(self._endpoints[:3])
             if not await self._check_tls_reachable(frag_tls=False, endpoints=probe_eps):
                 if await self._check_tls_reachable(frag_tls=True, endpoints=probe_eps):

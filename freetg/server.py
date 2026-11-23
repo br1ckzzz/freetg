@@ -150,6 +150,7 @@ class FreeTGConfig:
     frag_tls: bool = False
     prefer_port80_cf: bool = False
     allow_port80_fallback: bool = True
+    auto_tls_frag: bool = True
     stats_interval: float = 30.0
     verbose: bool = False
 
@@ -168,6 +169,7 @@ class FreeTGProxyServer:
             frag_tls=config.frag_tls,
             prefer_port80_cf=config.prefer_port80_cf,
             allow_port80_fallback=config.allow_port80_fallback,
+            auto_tls_frag=config.auto_tls_frag,
         )
         self._servers: List[asyncio.AbstractServer] = []
         self._client_tasks: Set[asyncio.Task] = set()

@@ -1,4 +1,4 @@
-"""Embedded WinDivert / winws DPI desync manager with clean full-unload watchdog."""
+"""Embedded zapret2 (winws2 + Lua) DPI desync manager with safe coexistence & cleanup."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .app_config import APP_DIR, ensure_dirs, parse_worker_domains, resource_path, sanitize_worker_domain
 
@@ -31,7 +31,16 @@ _CF_BASE_IPS: Tuple[str, ...] = (
     "172.67.206.124",
 )
 
-_WINWS_FILES: Tuple[str, ...] = (
+_WINWS2_FILES: Tuple[str, ...] = (
+    "winws2.exe",
+    "WinDivert.dll",
+    "WinDivert64.sys",
+    "cygwin1.dll",
+    "lua/zapret-lib.lua",
+    "lua/zapret-antidpi.lua",
+)
+
+_WINWS1_FILES: Tuple[str, ...] = (
     "winws.exe",
     "WinDivert.dll",
     "WinDivert64.sys",
@@ -40,12 +49,39 @@ _WINWS_FILES: Tuple[str, ...] = (
     "tls_clienthello_www_sferum_ru.bin",
 )
 
+ZAPRET2_PROFILE_ORDER: Tuple[str, ...] = (
+    "z2_md5_disorder",
+    "z2_autottl_fakedsplit",
+    "z2_disorder_only",
+)
+
+ZAPRET2_PROFILE_LABELS: Dict[str, str] = {
+    "z2_md5_disorder": "md5 + multidisorder",
+    "z2_autottl_fakedsplit": "autottl + fakedsplit",
+    "z2_disorder_only": "multidisorder (без фейков, для роутера/NAT)",
+}
+
+ZAPRET2_PROFILES: Dict[str, Tuple[str, ...]] = {
+    "z2_md5_disorder": (
+        "--lua-desync=fake:blob=fake_default_tls:tcp_md5:tcp_seq=-10000:repeats=6",
+        "--lua-desync=multidisorder:pos=1,midsld",
+    ),
+    "z2_autottl_fakedsplit": (
+        "--lua-desync=fake:blob=fake_default_tls:ip_autottl=-2,3-20:tcp_md5",
+        "--lua-desync=fakedsplit:pos=1,midsld:ip_autottl=-2,3-20:tcp_md5",
+    ),
+    "z2_disorder_only": (
+        "--lua-desync=multidisorder:pos=1,midsld",
+    ),
+}
+
 WINWS_RUNTIME_DIR = APP_DIR / "winws_bin"
 WINWS_PID_FILE = WINWS_RUNTIME_DIR / "winws.pid"
 WINWS_STOP_FILE = WINWS_RUNTIME_DIR / "stop.signal"
 WINWS_ARGS_JSON = WINWS_RUNTIME_DIR / "winws_args.json"
 WINWS_WATCHDOG_PS1 = WINWS_RUNTIME_DIR / "run_winws_watchdog.ps1"
 
+_WINWS_EXE_NAMES = frozenset({"winws.exe", "winws2.exe"})
 _TH32CS_SNAPPROCESS = 0x00000002
 _WAIT_TIMEOUT = 0x00000102
 _STILL_ACTIVE = 259
@@ -55,16 +91,17 @@ _SEE_MASK_FLAG_NO_UI = 0x00000400
 _WATCHDOG_SCRIPT = r"""param(
     [int]$ParentPid,
     [string]$RuntimeDir,
+    [string]$ExeName,
     [string]$PidFile,
     [string]$StopFile,
     [string]$ArgsJsonPath
 )
 $ErrorActionPreference = 'SilentlyContinue'
-$exePath = Join-Path $RuntimeDir 'winws.exe'
+$exePath = Join-Path $RuntimeDir $ExeName
 
-# Kill any stale winws.exe left running from our runtime directory
-Get-CimInstance Win32_Process -Filter "Name='winws.exe'" | ForEach-Object {
-    if ($_.ExecutablePath -and $_.ExecutablePath.Equals($exePath, [System.StringComparison]::OrdinalIgnoreCase)) {
+# Kill any stale own winws/winws2 left running from our runtime directory
+Get-CimInstance Win32_Process -Filter "Name='winws.exe' OR Name='winws2.exe'" | ForEach-Object {
+    if ($_.ExecutablePath -and $_.ExecutablePath.StartsWith($RuntimeDir, [System.StringComparison]::OrdinalIgnoreCase)) {
         Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
     }
 }
@@ -93,7 +130,12 @@ try {
     if ($proc -and -not $proc.HasExited) {
         Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
     }
-    & sc.exe stop WinDivert 2>&1 | Out-Null
+    $others = @(Get-CimInstance Win32_Process -Filter "Name='winws.exe' OR Name='winws2.exe'" | Where-Object {
+        $_.ProcessId -ne $proc.Id
+    })
+    if ($others.Count -eq 0) {
+        & sc.exe stop WinDivert 2>&1 | Out-Null
+    }
     Remove-Item -Force $PidFile -ErrorAction SilentlyContinue
     Remove-Item -Force $StopFile -ErrorAction SilentlyContinue
 }
@@ -145,6 +187,7 @@ def is_user_admin() -> bool:
 
 
 def _list_winws_pids() -> List[int]:
+    """Return PIDs of all running winws.exe and winws2.exe processes."""
     if sys.platform != "win32":
         return []
     kernel32 = ctypes.windll.kernel32
@@ -157,7 +200,7 @@ def _list_winws_pids() -> List[int]:
         entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
         ok = kernel32.Process32FirstW(snap, ctypes.byref(entry))
         while ok:
-            if entry.szExeFile.lower() == "winws.exe":
+            if entry.szExeFile.lower() in _WINWS_EXE_NAMES:
                 pids.append(int(entry.th32ProcessID))
             ok = kernel32.Process32NextW(snap, ctypes.byref(entry))
     finally:
@@ -166,50 +209,65 @@ def _list_winws_pids() -> List[int]:
 
 
 def _quote_arg(arg: str) -> str:
-    if not arg or any(ch in arg for ch in (' ', '\t', '"')):
+    if not arg or any(ch in arg for ch in (" ", "\t", '"')):
         return '"' + arg.replace('"', '\\"') + '"'
     return arg
 
 
-def _write_cf_ipset(worker_domain: str) -> Path:
-    ensure_dirs()
+def _write_cf_lists(worker_domain: str, target_dir: Path) -> Tuple[Path, Path]:
+    """Write cf_ipset.txt and cf_domains.txt inside target_dir for relative Cygwin-safe paths."""
+    target_dir.mkdir(parents=True, exist_ok=True)
     ips: List[str] = list(_CF_BASE_IPS)
-    seen = set(ips)
+    seen_ips = set(ips)
     for dom in parse_worker_domains(worker_domain):
         try:
             for info in socket.getaddrinfo(dom, 443, family=socket.AF_INET):
                 ip = info[4][0]
-                if ip not in seen:
-                    seen.add(ip)
+                if ip not in seen_ips:
+                    seen_ips.add(ip)
                     ips.append(ip)
         except OSError:
             pass
-    ipset_path = APP_DIR / "cf_ipset.txt"
+    ipset_path = target_dir / "cf_ipset.txt"
     ipset_path.write_text("\n".join(ips) + "\n", encoding="ascii")
-    return ipset_path
+
+    domains = ["workers.dev", "co.uk"]
+    for clean_dom in parse_worker_domains(worker_domain):
+        low = clean_dom.lower()
+        if not any(low == d or low.endswith("." + d) for d in domains):
+            domains.append(low)
+    domains_path = target_dir / "cf_domains.txt"
+    domains_path.write_text("\n".join(domains) + "\n", encoding="ascii")
+    return ipset_path, domains_path
 
 
-def _stage_winws_files() -> Tuple[Optional[Path], Optional[str]]:
-    """Copy bundled winws/WinDivert binaries out of _MEIPASS into %APPDATA%\\FreeTG\\winws_bin."""
+def _stage_winws_files(engine: str = "zapret2") -> Tuple[Optional[Path], Optional[str]]:
+    """Copy bundled zapret binaries and Lua modules into %APPDATA%\\FreeTG\\winws_bin."""
     ensure_dirs()
     src_dir = resource_path("assets/winws")
-    missing = [name for name in _WINWS_FILES if not (src_dir / name).exists()]
+    required = _WINWS1_FILES if engine == "zapret1" else _WINWS2_FILES
+    missing = [name for name in required if not (src_dir / name).exists()]
     if missing:
-        return None, f"Отсутствуют файлы встроенного winws: {', '.join(missing)}"
+        return None, f"Отсутствуют файлы встроенного {engine}: {', '.join(missing)}"
 
     WINWS_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    for name in _WINWS_FILES:
+    for name in required:
         src = src_dir / name
         dst = WINWS_RUNTIME_DIR / name
+        dst.parent.mkdir(parents=True, exist_ok=True)
         try:
             if not dst.exists() or dst.stat().st_size != src.stat().st_size:
                 shutil.copy2(src, dst)
         except OSError as exc:
-            # If destination is currently locked by an active winws.exe already staged there,
-            # reuse it cleanly rather than failing.
             if not dst.exists():
                 return None, f"Не удалось подготовить {name}: {exc}"
     return WINWS_RUNTIME_DIR, None
+
+
+def has_bundled_engine(engine: str) -> bool:
+    src_dir = resource_path("assets/winws")
+    required = _WINWS1_FILES if engine == "zapret1" else _WINWS2_FILES
+    return all((src_dir / name).exists() for name in required)
 
 
 def _read_pid_file() -> Optional[int]:
@@ -223,15 +281,86 @@ def _read_pid_file() -> Optional[int]:
     return None
 
 
+def _normalize_profile(profile: str) -> str:
+    p = (profile or "").strip().lower()
+    if p in ZAPRET2_PROFILES:
+        return p
+    return ZAPRET2_PROFILE_ORDER[0]
+
+
+def _build_zapret2_args(winws_dir: Path, worker_domain: str, profile: str) -> List[str]:
+    _write_cf_lists(worker_domain, winws_dir)
+    prof = _normalize_profile(profile)
+    desync_calls = list(ZAPRET2_PROFILES[prof])
+
+    return [
+        "--wf-tcp-out=443",
+        "--lua-init=@lua/zapret-lib.lua",
+        "--lua-init=@lua/zapret-antidpi.lua",
+        "--filter-tcp=443",
+        "--filter-l7=tls",
+        "--hostlist=cf_domains.txt",
+        "--out-range=-d10",
+        "--payload=tls_client_hello",
+        *desync_calls,
+        "--new",
+        "--filter-tcp=443",
+        "--filter-l7=tls",
+        "--ipset=cf_ipset.txt",
+        "--out-range=-d10",
+        "--payload=tls_client_hello",
+        *desync_calls,
+    ]
+
+
+def _build_zapret1_args(winws_dir: Path, worker_domain: str) -> List[str]:
+    ipset_path, _ = _write_cf_lists(worker_domain, winws_dir)
+    domains = ["workers.dev", "co.uk"]
+    for clean_dom in parse_worker_domains(worker_domain):
+        low = clean_dom.lower()
+        if not any(low == d or low.endswith("." + d) for d in domains):
+            domains.append(low)
+
+    desync_opts = [
+        "--dpi-desync", "fake,multisplit",
+        "--dpi-desync-split-seqovl", "480",
+        "--dpi-desync-split-pos", "1",
+        "--dpi-desync-fooling", "ts",
+        "--dpi-desync-repeats", "4",
+        "--dpi-desync-split-seqovl-pattern", "stun2.bin",
+        "--dpi-desync-fake-tls", "tls_clienthello_www_sferum_ru.bin",
+    ]
+    return [
+        "--wf-tcp", "443",
+        "--filter-tcp", "443",
+        "--hostlist-domains", ",".join(domains),
+        *desync_opts,
+        "--new",
+        "--filter-tcp", "443",
+        "--ipset", ipset_path.name,
+        *desync_opts,
+    ]
+
+
 class BuiltinDesyncManager:
-    """Starts and cleanly unloads the bundled winws.exe / WinDivert bypass."""
+    """Starts and cleanly unloads embedded zapret2 (winws2.exe) or zapret1 (winws.exe)."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._popen: Optional[subprocess.Popen] = None
         self._win_handle: Optional[int] = None
-        self._pid: Optional[int] = None  # direct winws PID or elevated watchdog PID
+        self._pid: Optional[int] = None
         self._active_domain: Optional[str] = None
+        self._active_profile: Optional[str] = None
+        self._active_engine: Optional[str] = None
+
+    @property
+    def active_engine(self) -> Optional[str]:
+        return self._active_engine
+
+    @property
+    def active_profile(self) -> Optional[str]:
+        return self._active_profile
 
     def _own_winws_pids(self) -> set[int]:
         pids = set()
@@ -268,73 +397,60 @@ class BuiltinDesyncManager:
         with self._lock:
             running = self._is_running_locked()
             own_pids = self._own_winws_pids() if running else set()
-        for pid in _list_winws_pids():
-            if pid not in own_pids:
-                return True
-        return False
+        return any(pid not in own_pids for pid in _list_winws_pids())
 
-    def _build_args(self, winws_dir: Path, worker_domain: str) -> List[str]:
-        ipset_path = _write_cf_ipset(worker_domain)
-        stun2 = winws_dir / "stun2.bin"
-        sferum = winws_dir / "tls_clienthello_www_sferum_ru.bin"
+    def _build_args(
+        self, winws_dir: Path, worker_domain: str, *, profile: str, engine: str
+    ) -> List[str]:
+        if engine == "zapret1":
+            return _build_zapret1_args(winws_dir, worker_domain)
+        return _build_zapret2_args(winws_dir, worker_domain, profile)
 
-        domains = ["workers.dev", "co.uk", "eu.cc"]
-        for clean_dom in parse_worker_domains(worker_domain):
-            low = clean_dom.lower()
-            if not any(low == d or low.endswith("." + d) for d in domains):
-                domains.append(low)
-
-        desync_opts = [
-            "--dpi-desync", "fake,multisplit",
-            "--dpi-desync-split-seqovl", "480",
-            "--dpi-desync-split-pos", "1",
-            "--dpi-desync-fooling", "ts",
-            "--dpi-desync-repeats", "4",
-            "--dpi-desync-split-seqovl-pattern", str(stun2),
-            "--dpi-desync-fake-tls", str(sferum),
-        ]
-
-        return [
-            "--wf-tcp", "443",
-            "--filter-tcp", "443",
-            "--hostlist-domains", ",".join(domains),
-            *desync_opts,
-            "--new",
-            "--filter-tcp", "443",
-            "--ipset", str(ipset_path),
-            *desync_opts,
-        ]
-
-    def start(self, worker_domain: str) -> Tuple[bool, Optional[str]]:
-        """Ensure winws DPI desync is active (either external zapret or bundled winws.exe)."""
+    def start(
+        self,
+        worker_domain: str,
+        *,
+        profile: str = "z2_md5_disorder",
+        engine: str = "zapret2",
+    ) -> Tuple[bool, Optional[str]]:
+        """Ensure DPI desync is active (yields if an external winws/winws2 is running)."""
         if sys.platform != "win32":
             return False, "Встроенный WinDivert доступен только на Windows."
 
         clean_domain = sanitize_worker_domain(worker_domain)
+        eff_engine = "zapret1" if engine == "zapret1" else "zapret2"
+        eff_profile = "z1_legacy" if eff_engine == "zapret1" else _normalize_profile(profile)
+        exe_name = "winws.exe" if eff_engine == "zapret1" else "winws2.exe"
 
         if self.is_external_winws_running():
-            log.info("External zapret/winws.exe detected; skipping built-in winws launch")
-            return True, "Используется внешний winws.exe (zapret)"
+            log.info("External zapret/zapret2 process detected; skipping built-in launch")
+            return True, "Используется внешний zapret"
 
         with self._lock:
             if self._is_running_locked():
-                if clean_domain == self._active_domain:
+                if (
+                    clean_domain == self._active_domain
+                    and eff_profile == self._active_profile
+                    and eff_engine == self._active_engine
+                ):
                     return True, None
                 self._stop_locked()
 
-            winws_dir, stage_err = _stage_winws_files()
+            winws_dir, stage_err = _stage_winws_files(eff_engine)
             if winws_dir is None:
                 return False, stage_err
 
-            winws_exe = winws_dir / "winws.exe"
+            winws_exe = winws_dir / exe_name
             try:
-                args = self._build_args(winws_dir, clean_domain)
+                args = self._build_args(
+                    winws_dir, clean_domain, profile=eff_profile, engine=eff_engine
+                )
                 if WINWS_STOP_FILE.exists():
                     WINWS_STOP_FILE.unlink()
                 if WINWS_PID_FILE.exists():
                     WINWS_PID_FILE.unlink()
             except Exception as exc:
-                return False, f"Не удалось подготовить параметры winws: {exc}"
+                return False, f"Не удалось подготовить параметры {exe_name}: {exc}"
 
             try:
                 if is_user_admin():
@@ -357,7 +473,7 @@ class BuiltinDesyncManager:
                         rc = proc.returncode
                         self._popen = None
                         self._pid = None
-                        return False, f"Встроенный winws.exe завершился сразу (код {rc})"
+                        return False, f"Встроенный {exe_name} завершился сразу (код {rc})"
                 else:
                     WINWS_ARGS_JSON.write_text(
                         json.dumps(args, ensure_ascii=False), encoding="utf-8"
@@ -373,6 +489,7 @@ class BuiltinDesyncManager:
                             "-File", str(WINWS_WATCHDOG_PS1),
                             "-ParentPid", str(os.getpid()),
                             "-RuntimeDir", str(winws_dir),
+                            "-ExeName", exe_name,
                             "-PidFile", str(WINWS_PID_FILE),
                             "-StopFile", str(WINWS_STOP_FILE),
                             "-ArgsJsonPath", str(WINWS_ARGS_JSON),
@@ -395,16 +512,15 @@ class BuiltinDesyncManager:
                         err_code = ctypes.windll.kernel32.GetLastError()
                         if err_code == 1223:  # ERROR_CANCELLED
                             return False, "Запрос прав администратора (UAC) для обхода ТСПУ отклонён пользователем."
-                        return False, f"Не удалось запустить встроенный winws.exe (ошибка Windows {err_code})"
+                        return False, f"Не удалось запустить встроенный {exe_name} (ошибка Windows {err_code})"
 
                     if not sei.hProcess:
-                        return False, "ShellExecuteExW не вернул дескриптор watchdog winws.exe"
+                        return False, f"ShellExecuteExW не вернул дескриптор watchdog {exe_name}"
 
                     kernel32 = ctypes.windll.kernel32
                     self._win_handle = int(sei.hProcess)
                     self._pid = int(kernel32.GetProcessId(sei.hProcess))
 
-                    # Wait briefly (up to 4s) for elevated watchdog to write winws.pid
                     deadline = time.monotonic() + 4.0
                     while time.monotonic() < deadline:
                         if WINWS_PID_FILE.exists():
@@ -415,26 +531,28 @@ class BuiltinDesyncManager:
                                 kernel32.CloseHandle(sei.hProcess)
                                 self._win_handle = None
                                 self._pid = None
-                                return False, f"Встроенный winws watchdog завершился (код {exit_code.value})"
+                                return False, f"Встроенный {exe_name} watchdog завершился (код {exit_code.value})"
                         time.sleep(0.1)
 
                 self._active_domain = clean_domain
+                self._active_profile = eff_profile
+                self._active_engine = eff_engine
                 log.info(
-                    "Started built-in winws.exe (winws_pid=%s, watchdog_pid=%s, domain=%s)",
+                    "Started built-in %s (pid=%s, profile=%s, domain=%s)",
+                    exe_name,
                     _read_pid_file(),
-                    self._pid,
+                    eff_profile,
                     clean_domain,
                 )
                 return True, None
             except Exception as exc:
                 self._stop_locked()
-                return False, f"Ошибка запуска встроенного winws.exe: {exc}"
+                return False, f"Ошибка запуска встроенного {exe_name}: {exc}"
 
     def _stop_locked(self) -> None:
         winws_pid = _read_pid_file()
         had_anything = bool(self._popen or self._win_handle or winws_pid)
 
-        # Signal elevated watchdog to terminate winws.exe + unload WinDivert cleanly
         try:
             if WINWS_RUNTIME_DIR.exists():
                 WINWS_STOP_FILE.write_text("stop", encoding="ascii")
@@ -453,19 +571,20 @@ class BuiltinDesyncManager:
                     pass
             self._popen = None
             if is_user_admin():
-                try:
-                    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-                    subprocess.run(
-                        ["sc.exe", "stop", "WinDivert"],
-                        creationflags=flags,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=2.0,
-                    )
-                except Exception:
-                    pass
+                other_pids = [p for p in _list_winws_pids() if p != winws_pid]
+                if not other_pids:
+                    try:
+                        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+                        subprocess.run(
+                            ["sc.exe", "stop", "WinDivert"],
+                            creationflags=flags,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=2.0,
+                        )
+                    except Exception:
+                        pass
 
-        # Wait up to 2.0s for the elevated watchdog to stop winws.exe & remove winws.pid
         if self._win_handle or (winws_pid and winws_pid in _list_winws_pids()):
             deadline = time.monotonic() + 2.0
             while time.monotonic() < deadline:
@@ -490,22 +609,24 @@ class BuiltinDesyncManager:
                 pass
 
         if had_anything:
-            log.info("Stopped built-in winws.exe (pid=%s)", winws_pid or self._pid)
+            log.info("Stopped built-in %s (pid=%s)", self._active_engine or "winws", winws_pid or self._pid)
         self._pid = None
         self._active_domain = None
+        self._active_profile = None
+        self._active_engine = None
 
     def stop(self) -> None:
         with self._lock:
             self._stop_locked()
 
     def yield_if_external_running(self) -> bool:
-        """Stop built-in winws.exe if an external zapret/winws.exe process is active."""
+        """Stop built-in process if an external zapret/zapret2 process appears."""
         with self._lock:
             if not self._is_running_locked():
                 return False
             own_pids = self._own_winws_pids()
         if any(pid not in own_pids for pid in _list_winws_pids()):
-            log.info("External zapret/winws.exe started; stopping built-in winws.exe")
+            log.info("External zapret/zapret2 detected; stopping built-in %s", self._active_engine or "winws")
             self.stop()
             return True
         return False

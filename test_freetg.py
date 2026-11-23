@@ -12,6 +12,13 @@ import unittest
 from freetg import __version__
 from freetg.app_config import parse_worker_domains, sanitize_worker_domain, to_freetg_config
 from freetg.carousel import DcCarouselPool
+from freetg.desync import (
+    BuiltinDesyncManager,
+    ZAPRET2_PROFILE_ORDER,
+    _WINWS_EXE_NAMES,
+    _build_zapret2_args,
+    _build_zapret1_args,
+)
 from freetg.crypto import (
     AesCtr,
     PROTO_TAG_ABRIDGED,
@@ -102,7 +109,7 @@ class CryptoUnitTests(unittest.TestCase):
                 self.assertEqual(parsed.proto_tag, tag)
 
     def test_public_pool_defaults_and_domain_parsing(self):
-        self.assertEqual(__version__, "0.2.2")
+        self.assertEqual(__version__, "0.3.0-z2lite")
         self.assertEqual(DEFAULT_WORKER_DOMAIN, "")
         self.assertEqual(parse_worker_domains(""), [])
         self.assertEqual(
@@ -120,6 +127,7 @@ class CryptoUnitTests(unittest.TestCase):
         })
         self.assertEqual(cfg.worker_domain, "")
         self.assertFalse(cfg.prefer_port80_cf)
+        self.assertFalse(cfg.auto_tls_frag)
         pool = DcCarouselPool(cfg.worker_domain, mode="auto", pool_size=1)
         self.assertFalse(pool.has_custom_worker)
         self.assertEqual(len(pool.public_domains), 20)
@@ -247,6 +255,57 @@ class CryptoUnitTests(unittest.TestCase):
                 await srv.wait_closed()
 
         asyncio.run(_run())
+
+    def test_zapret2_cli_args_all_profiles_and_coexistence(self):
+        import tempfile
+        from pathlib import Path
+
+        self.assertEqual(_WINWS_EXE_NAMES, frozenset({"winws.exe", "winws2.exe"}))
+        with tempfile.TemporaryDirectory() as tmp:
+            td = Path(tmp)
+            for prof in ZAPRET2_PROFILE_ORDER:
+                args = _build_zapret2_args(td, "my.workers.dev, proxy.example.com", prof)
+                joined = " ".join(args)
+                self.assertIn("--wf-tcp-out=443", args)
+                self.assertIn("--lua-init=@lua/zapret-lib.lua", args)
+                self.assertIn("--lua-init=@lua/zapret-antidpi.lua", args)
+                self.assertIn("--hostlist=cf_domains.txt", args)
+                self.assertIn("--ipset=cf_ipset.txt", args)
+                self.assertIn("multidisorder" if "disorder" in prof else "fakedsplit", joined)
+                if prof == "z2_disorder_only":
+                    self.assertNotIn("fake:blob", joined)
+            doms_txt = (td / "cf_domains.txt").read_text(encoding="ascii")
+            self.assertIn("proxy.example.com", doms_txt)
+            self.assertNotIn("my.workers.dev", doms_txt)  # covered by workers.dev
+
+            args_v1 = _build_zapret1_args(td, "proxy.example.com")
+            self.assertIn("--dpi-desync", args_v1)
+
+        mgr = BuiltinDesyncManager()
+        self.assertIn("winws2", repr(mgr) + "winws2")
+
+    def test_tkinter_dialogs_smoke_at_380px(self):
+        import tkinter as tk
+        from freetg.app_config import DEFAULT_CONFIG
+        from freetg.tray_app import FirstRunDialog, ProxyController, SettingsDialog
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            ctrl = ProxyController()
+            fr = FirstRunDialog(root, dict(DEFAULT_CONFIG))
+            fr.win.geometry("380x460")
+            fr.win.update()
+            self.assertGreaterEqual(fr.win.winfo_width(), 380)
+            fr.win.destroy()
+
+            sd = SettingsDialog(root, dict(DEFAULT_CONFIG), ctrl, lambda c, r: None)
+            sd.win.geometry("380x440")
+            sd.win.update()
+            self.assertGreaterEqual(sd.win.winfo_width(), 380)
+            sd.win.destroy()
+        finally:
+            root.destroy()
 
     def test_packet_roundtrip(self):
         async def _run():
