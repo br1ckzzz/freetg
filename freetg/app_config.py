@@ -40,6 +40,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "verbose": False,
     "log_max_mb": 5,
     "autostart": False,
+    "check_updates": True,
+    "skipped_update_tag": "",
 }
 
 _RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"

@@ -51,6 +51,7 @@ from .desync import (
     has_bundled_engine,
 )
 from .server import FreeTGProxyServer, _human_bytes
+from .updater import UpdateInfo, check_for_update_sync
 from .win_tray import Win32TrayIcon, apply_dark_titlebar, enable_high_dpi
 
 log = logging.getLogger("freetg.tray")
@@ -1108,6 +1109,73 @@ class FirstRunDialog:
         self.win.destroy()
 
 
+class UpdateDialog:
+    """Modal notification showing available GitHub release details and download actions."""
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        info: UpdateInfo,
+        *,
+        on_skip: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        self._info = info
+        self._on_skip = on_skip
+
+        self.win = tk.Toplevel(master)
+        self.win.configure(bg=_BG)
+        self.win.minsize(380, 300)
+        self.win.geometry("460x340")
+        _apply_window_branding(self.win, title=f"{APP_NAME} — Доступно обновление {info.tag}")
+        self._logo = _load_logo_photo(self.win)
+
+        outer = tk.Frame(self.win, bg=_BG)
+        outer.pack(fill="both", expand=True, padx=16, pady=14)
+
+        hdr = tk.Frame(outer, bg=_BG)
+        hdr.pack(fill="x", pady=(0, 10))
+        if self._logo is not None:
+            tk.Label(hdr, image=self._logo, bg=_BG).pack(side="left", padx=(0, 12))
+        col = tk.Frame(hdr, bg=_BG)
+        col.pack(side="left", fill="x", expand=True)
+        tk.Label(
+            col,
+            text=f"Доступна новая версия {info.tag}",
+            bg=_BG, fg="#F8FAFC", font=("Segoe UI", 12, "bold"), anchor="w",
+        ).pack(fill="x")
+        tk.Label(
+            col,
+            text=f"Текущая версия: v{__version__}",
+            bg=_BG, fg=_ACCENT_HOVER, font=("Segoe UI", 9), anchor="w",
+        ).pack(fill="x")
+
+        card = tk.Frame(outer, bg=_CARD_BG, highlightbackground=_CARD_BORDER, highlightthickness=1)
+        card.pack(fill="both", expand=True, pady=(0, 12))
+        tk.Label(
+            card,
+            text=info.notes_summary,
+            bg=_CARD_BG, fg="#CBD5E1", justify="left", anchor="nw", wraplength=400,
+            font=("Segoe UI", 9),
+        ).pack(fill="both", expand=True, padx=12, pady=10)
+
+        footer = _WrapFrame(outer, bg=_BG)
+        footer.pack(fill="x")
+        footer.add_widget(
+            _make_btn(footer, "Открыть релиз", lambda: webbrowser.open(info.html_url), primary=True)
+        )
+        if info.download_url and info.download_url != info.html_url:
+            footer.add_widget(
+                _make_btn(footer, "Скачать FreeTG.exe", lambda: webbrowser.open(info.download_url))
+            )
+        footer.add_widget(_make_btn(footer, "Пропустить версию", self._handle_skip))
+        footer.add_widget(_make_btn(footer, "Позже", self.win.destroy))
+
+    def _handle_skip(self) -> None:
+        if self._on_skip is not None:
+            self._on_skip(self._info.tag)
+        self.win.destroy()
+
+
 class SettingsDialog:
     """Minimalist dark responsive Settings dialog using pure tkinter."""
 
@@ -1140,6 +1208,9 @@ class SettingsDialog:
         on_toggle_server: Optional[Callable[[], None]] = None,
         on_full_exit: Optional[Callable[[], None]] = None,
         on_open_guide: Optional[Callable[[], None]] = None,
+        available_update: Optional[UpdateInfo] = None,
+        on_open_update: Optional[Callable[[UpdateInfo], None]] = None,
+        on_update_found: Optional[Callable[[UpdateInfo], None]] = None,
     ) -> None:
         self._cfg = deepcopy(cfg)
         self._controller = controller
@@ -1147,7 +1218,11 @@ class SettingsDialog:
         self._on_toggle_server = on_toggle_server
         self._on_full_exit = on_full_exit
         self._on_open_guide = on_open_guide
+        self._available_update = available_update
+        self._on_open_update = on_open_update
+        self._on_update_found = on_update_found
         self._testing = False
+        self._checking_updates = False
         self._adv_open = False
 
         self._bypass_items = list(self._BYPASS_ITEMS)
@@ -1183,10 +1258,24 @@ class SettingsDialog:
         )
         self._status_lbl.pack(fill="x")
 
+        # Update banner (hidden unless a newer GitHub release is available)
+        self._upd_banner = tk.Frame(
+            outer, bg="#064E3B", highlightbackground=_ACCENT, highlightthickness=1
+        )
+        self._upd_banner_lbl = tk.Label(
+            self._upd_banner, text="", bg="#064E3B", fg="#ECFDF5", font=("Segoe UI", 9, "bold"), anchor="w"
+        )
+        self._upd_banner_lbl.pack(side="left", fill="x", expand=True, padx=(10, 6), pady=6)
+        _make_btn(
+            self._upd_banner, "Подробнее", self._open_update_banner, primary=True
+        ).pack(side="right", padx=6, pady=4)
+        if self._available_update is not None:
+            self._show_update_banner(self._available_update)
+
         # Scroll body
-        scroll = _ScrollableFrame(outer, bg=_BG)
-        scroll.pack(fill="both", expand=True)
-        body = scroll.inner
+        self._scroll = _ScrollableFrame(outer, bg=_BG)
+        self._scroll.pack(fill="both", expand=True)
+        body = self._scroll.inner
 
         # Card 1: MTProto
         c1 = self._make_card(body, "Подключение MTProto")
@@ -1266,9 +1355,11 @@ class SettingsDialog:
 
         self.frag_var = tk.BooleanVar(value=bool(self._cfg.get("frag_tls", False)))
         self.builtin_desync_var = tk.BooleanVar(value=bool(self._cfg.get("builtin_desync", True)))
+        self.check_updates_var = tk.BooleanVar(value=bool(self._cfg.get("check_updates", True)))
         self.verbose_var = tk.BooleanVar(value=bool(self._cfg.get("verbose", False)))
         self._check(self._adv_frame, "Фрагментация TLS ClientHello", self.frag_var).pack(anchor="w", pady=2)
         self._check(self._adv_frame, "Встроенный zapret2 (если 443 и Port 80 закрыты)", self.builtin_desync_var).pack(anchor="w", pady=2)
+        self._check(self._adv_frame, "Проверять обновления на GitHub", self.check_updates_var).pack(anchor="w", pady=2)
 
         log_row = _WrapFrame(self._adv_frame, bg=_CARD_BG)
         log_row.pack(fill="x", pady=(4, 0))
@@ -1283,6 +1374,8 @@ class SettingsDialog:
         tk.Label(mb_wrap, text=" МБ", bg=_CARD_BG, fg=_MUTED, font=("Segoe UI", 9)).pack(side="left")
         log_row.add_widget(mb_wrap)
         log_row.add_widget(_make_btn(log_row, "Открыть логи", self._open_logs))
+        self.check_upd_btn = _make_btn(log_row, "Проверить обновления", self._handle_check_updates)
+        log_row.add_widget(self.check_upd_btn)
 
         # Responsive footer
         footer = _WrapFrame(outer, bg=_BG)
@@ -1398,6 +1491,51 @@ class SettingsDialog:
         self.win.destroy()
         if self._on_full_exit is not None:
             self._on_full_exit()
+
+    def _show_update_banner(self, info: UpdateInfo) -> None:
+        self._available_update = info
+        self._upd_banner_lbl.configure(text=f"★ Доступно обновление FreeTG {info.tag}")
+        self._upd_banner.pack(fill="x", pady=(0, 8), before=self._scroll)
+
+    def _open_update_banner(self) -> None:
+        if self._available_update is None:
+            return
+        if self._on_open_update is not None:
+            self._on_open_update(self._available_update)
+        else:
+            UpdateDialog(self.win, self._available_update)
+
+    def _handle_check_updates(self) -> None:
+        if self._checking_updates:
+            return
+        self._checking_updates = True
+        self.check_upd_btn.configure(state="disabled", text="Проверка...")
+
+        def _worker() -> None:
+            info, err = check_for_update_sync(__version__)
+            if self.win.winfo_exists():
+                self.win.after(0, lambda: self._on_manual_update_result(info, err))
+
+        threading.Thread(target=_worker, daemon=True, name="freetg-manual-upd").start()
+
+    def _on_manual_update_result(self, info: Optional[UpdateInfo], err: Optional[str]) -> None:
+        self._checking_updates = False
+        if not self.win.winfo_exists():
+            return
+        self.check_upd_btn.configure(state="normal", text="Проверить обновления")
+        if err:
+            messagebox.showwarning(APP_NAME, f"Не удалось проверить обновления:\n{err}", parent=self.win)
+            return
+        if info is None:
+            messagebox.showinfo(APP_NAME, f"Установлена актуальная версия (v{__version__}).", parent=self.win)
+            return
+        self._show_update_banner(info)
+        if self._on_update_found is not None:
+            self._on_update_found(info)
+        if self._on_open_update is not None:
+            self._on_open_update(info)
+        else:
+            UpdateDialog(self.win, info)
 
     def _open_logs(self) -> None:
         if LOG_FILE.exists():
@@ -1547,6 +1685,8 @@ class SettingsDialog:
             "verbose": bool(self.verbose_var.get()),
             "log_max_mb": log_max_mb,
             "autostart": bool(self.autostart_var.get()),
+            "check_updates": bool(self.check_updates_var.get()),
+            "skipped_update_tag": str(self._cfg.get("skipped_update_tag", "")),
         }
 
         if bool(new_cfg["autostart"]) != bool(self._cfg.get("autostart", False)) or new_cfg["autostart"]:
@@ -1578,6 +1718,8 @@ class FreeTGTrayApplication:
 
         self._settings_dlg: Optional[SettingsDialog] = None
         self._first_run_dlg: Optional[FirstRunDialog] = None
+        self._update_dlg: Optional[UpdateDialog] = None
+        self._available_update: Optional[UpdateInfo] = None
 
         ico_path = resource_path("icon.ico")
         self.tray = Win32TrayIcon(
@@ -1619,18 +1761,25 @@ class FreeTGTrayApplication:
         host = get_link_host(str(self.cfg.get("host", "127.0.0.1")))
         port = int(self.cfg.get("port", 1080))
         running = self.controller.is_running()
-        return [
+        items = [
             (f"Открыть в Telegram ({host}:{port})", lambda: self._post(lambda: _open_tg_link(self.cfg, self.tray, self.root)), True),
             ("Скопировать ссылку", lambda: self._post(self._on_copy_link), False),
+        ]
+        if self._available_update is not None:
+            upd = self._available_update
+            items.append((f"★ Обновление доступно ({upd.tag})...", lambda u=upd: self._post(lambda: self._open_update_dialog(u)), False))
+        items.extend([
             (None, None, False),
             ("Остановить сервер" if running else "Запустить сервер", lambda: self._post(self._on_toggle_server_clicked), False),
             ("Перезапустить прокси", lambda: self._post(self._on_restart_clicked), False),
             ("Настройки...", lambda: self._post(self._open_settings), False),
             ("Инструкция подключения", lambda: self._post(lambda: self._open_first_run(force=True)), False),
+            ("Проверить обновления", lambda: self._post(lambda: self._start_update_check(manual=True)), False),
             ("Открыть логи", lambda: self._post(self._on_open_logs), False),
             (None, None, False),
             ("Выход (выгрузить полностью)", lambda: self._post(self._on_exit), False),
-        ]
+        ])
+        return items
 
     def _on_copy_link(self) -> None:
         url = tg_proxy_url(self.cfg)
@@ -1716,8 +1865,64 @@ class FreeTGTrayApplication:
             on_toggle_server=self._on_toggle_server_clicked,
             on_full_exit=self._on_exit,
             on_open_guide=lambda: self._open_first_run(force=True),
+            available_update=self._available_update,
+            on_open_update=self._open_update_dialog,
+            on_update_found=self._set_available_update,
         )
         self._settings_dlg.win.lift()
+
+    def _set_available_update(self, info: UpdateInfo) -> None:
+        self._available_update = info
+
+    def _skip_update_version(self, tag: str) -> None:
+        self.cfg["skipped_update_tag"] = tag
+        save_config(self.cfg)
+        self._available_update = None
+
+    def _open_update_dialog(self, info: UpdateInfo) -> None:
+        if self._update_dlg is not None and self._update_dlg.win.winfo_exists():
+            self._update_dlg.win.deiconify()
+            self._update_dlg.win.lift()
+            self._update_dlg.win.focus_force()
+            return
+        parent = (
+            self._settings_dlg.win
+            if (self._settings_dlg is not None and self._settings_dlg.win.winfo_exists())
+            else self.root
+        )
+        self._update_dlg = UpdateDialog(parent, info, on_skip=self._skip_update_version)
+        self._update_dlg.win.lift()
+
+    def _start_update_check(self, *, manual: bool = False) -> None:
+        def _worker() -> None:
+            info, err = check_for_update_sync(__version__)
+            self._post(lambda: self._on_update_checked(info, err, manual=manual))
+
+        threading.Thread(target=_worker, daemon=True, name="freetg-update-check").start()
+
+    def _on_update_checked(
+        self, info: Optional[UpdateInfo], err: Optional[str], *, manual: bool
+    ) -> None:
+        if err:
+            if manual:
+                show_native_info(f"Не удалось проверить обновления:\n{err}", APP_NAME, error=True)
+            return
+        if info is None:
+            if manual:
+                show_native_info(f"Установлена актуальная версия FreeTG (v{__version__}).", APP_NAME)
+            return
+        if not manual and info.tag == self.cfg.get("skipped_update_tag", ""):
+            return
+        self._available_update = info
+        if self._settings_dlg is not None and self._settings_dlg.win.winfo_exists():
+            self._settings_dlg._show_update_banner(info)
+        if manual:
+            self._open_update_dialog(info)
+        else:
+            self.tray.show_notification(
+                APP_NAME,
+                f"Доступно обновление FreeTG {info.tag} (установлена v{__version__}). Откройте «Обновление» в меню трея.",
+            )
 
     def _on_settings_applied(self, new_cfg: Dict[str, Any], restart_needed: bool) -> None:
         self.cfg = new_cfg
@@ -1752,7 +1957,7 @@ class FreeTGTrayApplication:
         self._exiting = True
         log.info("Exiting FreeTG tray application")
         self.tray.stop()
-        for dlg in (self._settings_dlg, self._first_run_dlg):
+        for dlg in (self._settings_dlg, self._first_run_dlg, self._update_dlg):
             if dlg is not None:
                 try:
                     if dlg.win.winfo_exists():
@@ -1794,6 +1999,9 @@ class FreeTGTrayApplication:
                 self.tray.show_notification(APP_NAME, f"Прокси запущен: {host}:{port}")
         elif err:
             self.root.after(200, self._open_settings)
+
+        if self.cfg.get("check_updates", True):
+            self.root.after(4000, lambda: self._start_update_check(manual=False))
 
         self.root.after(100, self._pump_ui_queue)
         self.root.mainloop()
